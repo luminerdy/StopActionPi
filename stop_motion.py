@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
+from threading import Event, Thread
 from time import monotonic
 
 import cv2
@@ -73,13 +74,36 @@ def save_photo(path, photo, *, replace=False):
             temporary.unlink(missing_ok=True)
 
 
+class CameraFeed:
+    """Keep webcam reads from blocking Tk or slowing movie playback."""
+
+    def __init__(self, camera):
+        self.latest = None
+        self.finished = Event()
+        self.reader = Thread(target=self.read_frames, args=(camera,), daemon=True)
+        self.reader.start()
+
+    def read_frames(self, camera):
+        while not self.finished.is_set():
+            try:
+                ok, photo = camera.read()
+            except cv2.error:
+                ok = False
+            self.latest = photo if ok else None
+            self.finished.wait(0.01 if ok else 0.2)
+
+    def close(self):
+        self.finished.set()
+        self.reader.join()
+
+
 class Studio:
     RECENT_COUNT = 6
 
-    def __init__(self, root, tk, camera, folder, frames, fps, exporter):
+    def __init__(self, root, tk, feed, folder, frames, fps, exporter):
         self.root = root
         self.tk = tk
-        self.camera = camera
+        self.feed = feed
         self.folder = folder
         self.frames = frames
         self.fps = fps
@@ -227,17 +251,15 @@ class Studio:
             number.configure(fg=self.accent if selected else self.muted)
 
     def refresh_camera(self):
-        ok, photo = self.camera.read()
-        if ok:
-            self.live_photo = photo
-            if self.review_index is None:
-                self.update_picture()
-        elif self.live_photo is not None or self.review_index is None:
-            self.live_photo = None
-            if self.review_index is None:
+        photo = self.feed.latest
+        if self.review_index is None:
+            if photo is None:
                 self.show_camera_error()
-        delay = 90 if self.review_index is not None else 25
-        self.camera_job = self.root.after(delay if ok else 200, self.refresh_camera)
+            elif photo is not self.live_photo:
+                self.live_photo = photo
+                self.update_picture()
+        self.live_photo = photo
+        self.camera_job = self.root.after(25, self.refresh_camera)
 
     def show_camera_error(self):
         self.picture.configure(image="", text="Waiting for camera. Check the USB connection.")
@@ -397,6 +419,7 @@ class Studio:
         elif key == "o" and self.review_index is None:
             self.ghost = not self.ghost
             self.update_controls()
+            self.update_picture()
             if not self.ghost:
                 self.tell("Ghost overlay off.")
             elif not self.frames:
@@ -461,8 +484,8 @@ def main():
         if not camera.isOpened():
             raise ValueError("Cannot open webcam. Close other camera apps or try --camera 1.")
         if sys.platform.startswith("linux"):
-            # The C270 supports faster 720p previews over USB in Motion JPEG.
-            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            # Prefer the C270's uncompressed mode for a clean 720p preview.
+            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         try:
@@ -470,9 +493,13 @@ def main():
         except tk.TclError as error:
             raise ValueError(f"Could not open the studio window. Run from the Pi desktop: {error}") from error
         print(f"Project: {folder}")
-        with ThreadPoolExecutor(max_workers=1) as exporter:
-            Studio(root, tk, camera, folder, frames, args.fps, exporter)
-            root.mainloop()
+        feed = CameraFeed(camera)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as exporter:
+                Studio(root, tk, feed, folder, frames, args.fps, exporter)
+                root.mainloop()
+        finally:
+            feed.close()
     finally:
         camera.release()
 
