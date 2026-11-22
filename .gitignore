@@ -1,0 +1,7 @@
+__pycache__/
+projects/
+*.mp4
+frame_*.png
+.env
+.env.*
+.codex/
