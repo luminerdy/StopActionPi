@@ -2,34 +2,51 @@
 
 StopActionPi is a small stop motion studio for a Raspberry Pi 500 and a USB webcam. A child can move a figure, capture a frame with the built-in keyboard, and watch the scene come to life. The app keeps the photos so a movie can be finished or exported later.
 
-## First release
+## App behavior
 
 | What a maker needs | Behavior |
 | --- | --- |
+| Start or resume a movie | The desktop launcher opens a welcome screen with recent projects, New Movie, and Open Folder. The app opens automatically when the desktop session starts. |
 | See the scene | Show the live camera, photo count, and keyboard guide in one window. Request 1280 × 720 from the Logitech C270. |
 | Take a photo | Space saves one clean PNG and updates the thumbnail strip. Holding Space does not add extra photos. |
 | Remember what moved | O overlays the newest photo on the live image. The arrow keys let the maker flip between saved photos. |
 | See the motion | P plays from the first photo to the latest. L loops the last six at up to six photos per second. Space pauses or resumes review. Esc returns to the camera. |
+| Change the speed | S switches between 6 and 12 fps for full playback and the next MP4 export. Show the selected speed and estimated movie length. |
 | Fix a shot | R arms a retake of the last photo. Space saves the replacement to the same slot. Esc cancels and keeps the original. |
+| Remove a shot | During review, Delete asks to remove the selected photo. Enter removes it from the project sequence and Esc keeps it. The original remains in the local `.removed` folder. |
 | Make a movie | E writes a silent H.264 MP4 at the selected rate. Playback and export default to 12 photos per second. Exports get distinct filenames. |
+| Join finished movies | J opens a list where makers pick and order two or more MP4s from any project. Join writes a new silent MP4 in the current project. The original clips keep their timing and remain on disk. |
+| Join photo folders | I opens a list of folders. Join copies supported images in folder order and sorts each folder's files by name with numbers in sequence. The new folder starts at 000 and can be opened as a project for review and export. |
+| Narrate a movie | N opens the Recording Studio. Makers scrub a finished MP4, mark a section, and rehearse with a lead-in. R starts a countdown and records the selected section. P previews the pending take, K keeps it, and E saves a new MP4. The rest of the narration stays in place. |
 | Continue tomorrow | Reopen the same project folder and capture continues after the last saved photo. |
 
 ## Implementation
 
-- Raspberry Pi OS Desktop on a Pi 500 is the target. A fixed camera mount and steady lighting make changes between photos easier to see.
-- OpenCV reads the USB camera. Tk presents the keyboard controls, live view, thumbnails, and review. FFmpeg encodes the MP4.
-- A project is an ordinary local folder of numbered PNG files and exported movies. No account or internet connection is required to use the installed studio.
-- The repository contains source and instructions. Keep animation projects, photos, exports, credentials, and machine-specific settings outside version control.
+- The target is Raspberry Pi OS Desktop on a Pi 500. Capture and review share one primary window on a single monitor. The join and narration tools open separate panels on that monitor.
+- OpenCV reads frames in the background so a slow webcam does not hold up review. Tk draws the preview and keyboard controls. FFmpeg writes H.264 MP4 files with AAC audio for narrated exports.
+- Camera projects save numbered PNGs. Joined photo folders preserve the source formats and use names starting at `000`. Deleting a photo moves it into `.removed/`, and playback and exports use the remaining photos in numeric order.
+- The Recording Studio loads existing narration or starts with a silent track. Retakes are temporary until kept. A kept take replaces only the recorded part of its marked section. Saving writes a new MP4 with the edited audio and copies the original video stream.
+- Project folders remain local. The installed studio works without an account or internet connection.
+
+## Source guide
+
+| File | Role |
+| --- | --- |
+| [`stop_motion.py`](stop_motion.py) | Webcam capture, frame storage, review, and MP4 export |
+| [`project_picker.py`](project_picker.py) | Welcome screen and project selection |
+| [`install_desktop.py`](install_desktop.py) | Per-user desktop icon, menu entry, and autostart |
+| [`clip_joiner.py`](clip_joiner.py) | Ordered joins for MP4 clips and photo folders |
+| [`narration_studio.py`](narration_studio.py) | Narration timeline, recording controls, cue line, and take review |
+| [`narration.py`](narration.py) | Microphone selection, audio editing, playback preparation, and narrated MP4 export |
 
 ## First run acceptance check
 
 1. Launch from the Pi desktop. Confirm the C270 preview appears and the keyboard guide is legible.
 2. Capture three distinct photos. Verify the thumbnail strip grows and the saved PNGs contain only the camera image.
 3. Move a prop and use O to compare positions. Use the arrows to flip between the last two saved photos.
-4. Play all three photos, loop them, and return to live capture.
+4. Play all three photos at both speeds, loop them, and return to live capture.
 5. Cancel a retake, then complete one. Check that the photo count stays at three and that only the last shot changes.
-6. Save a movie, play the MP4, quit, and reopen the project. The next photo should be numbered four.
+6. Remove the middle photo in review. Play and export the remaining two in order. Quit and reopen the project, then capture a new photo. The new shot should follow the two remaining photos.
 
-## Next experiment
-
-Try an optional second display after the single window workflow is comfortable. Keep the live camera and ghost overlay on the monitor nearest the set. Use the second display for thumbnails and playback while keeping the same keyboard controls.
+7. Join two exports at different speeds. Check that they appear in the chosen order and keep their original pacing. Join two photo folders and verify that numbering continues across the folder boundary.
+8. Open an exported MP4 in the Recording Studio, mark a short section, and rehearse. Record it, listen back, and keep the take. Save and reopen the narrated MP4. Replace a second section and check that the first take is still in place.

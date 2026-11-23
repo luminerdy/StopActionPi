@@ -8,22 +8,46 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Event, Thread
 from time import monotonic
 
 import cv2
 
+from clip_joiner import IMAGE_SUFFIXES, ClipJoinDialog, ImageJoinDialog
+
+
+REMOVED_DIR = ".removed"
+
+
+def frame_number(path):
+    legacy = path.stem.startswith("frame_")
+    digits = path.stem[6:] if legacy else path.stem
+    width = 6 if legacy else 3
+    if digits.isascii() and digits.isdigit():
+        number = int(digits)
+        if (number > 0 or not legacy) and digits == f"{number:0{width}d}":
+            return number
+    raise ValueError(f"Unexpected photo filename: {path.name}.")
+
 
 def project_frames(folder):
-    frames = sorted(folder.glob("frame_*.png"))
-    if frames != [folder / f"frame_{i:06d}.png" for i in range(1, len(frames) + 1)]:
-        raise ValueError("Frame numbers have gaps. Restore missing frames to open this project.")
+    if not folder.is_dir():
+        return []
+    frames = list(folder.glob("frame_*.png"))
+    frames.extend(
+        path for path in folder.iterdir()
+        if path.suffix.lower() in IMAGE_SUFFIXES and path.stem.isascii() and path.stem.isdecimal() and path.is_file()
+    )
+    frames.sort(key=frame_number)
+    if len(set(map(frame_number, frames))) != len(frames):
+        raise ValueError("More than one photo uses the same frame number in this project.")
     return frames
 
 
 def export_movie(folder, fps):
-    """Encode a complete, numbered sequence without overwriting previous exports."""
+    """Encode the remaining photos in order without overwriting previous exports."""
+    folder = folder.resolve()
     frames = project_frames(folder)
     if not frames:
         raise ValueError("Capture at least one frame first.")
@@ -35,18 +59,40 @@ def export_movie(folder, fps):
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-n",
         "-framerate", str(fps), "-start_number", "1",
-        "-i", str(folder / "frame_%06d.png"),
+        "-i", "frame_%06d.png",
         "-frames:v", str(len(frames)),
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
     ]
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        # FFmpeg expects consecutive filenames. Keep the saved photos in place.
+        with TemporaryDirectory(prefix=".export-", dir=folder) as directory:
+            numbered = any(not photo.stem.startswith("frame_") for photo in frames)
+            if numbered:
+                height, width = read_photo(frames[0]).shape[:2]
+            for number, photo in enumerate(frames, start=1):
+                staged = Path(directory) / f"frame_{number:06d}.png"
+                if numbered:
+                    image = resize_to_fit(read_photo(photo), width, height)
+                    vertical = height - image.shape[0]
+                    horizontal = width - image.shape[1]
+                    image = cv2.copyMakeBorder(
+                        image, vertical // 2, vertical - vertical // 2,
+                        horizontal // 2, horizontal - horizontal // 2, cv2.BORDER_CONSTANT,
+                    )
+                    save_photo(staged, image)
+                else:
+                    try:
+                        staged.hardlink_to(photo)
+                    except OSError:
+                        shutil.copyfile(photo, staged)
+            subprocess.run(command, cwd=directory, check=True, capture_output=True, text=True)
         partial.rename(output)
     except subprocess.CalledProcessError as error:
-        partial.unlink(missing_ok=True)
         raise ValueError(f"Export failed: {error.stderr.strip()}") from error
+    finally:
+        partial.unlink(missing_ok=True)
     return output
 
 
@@ -57,8 +103,15 @@ def read_photo(path):
     return photo
 
 
+def resize_to_fit(photo, width, height):
+    source_height, source_width = photo.shape[:2]
+    scale = min(width / source_width, height / source_height)
+    size = (max(1, int(source_width * scale)), max(1, int(source_height * scale)))
+    return cv2.resize(photo, size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+
+
 def save_photo(path, photo, *, replace=False):
-    ok, encoded = cv2.imencode(".png", photo)
+    ok, encoded = cv2.imencode(path.suffix.lower(), photo)
     if not ok:
         raise ValueError("Could not prepare the photo to save.")
     temporary = None
@@ -106,6 +159,9 @@ class Studio:
         self.feed = feed
         self.folder = folder
         self.frames = frames
+        stored_frames = frames + project_frames(folder / REMOVED_DIR)
+        self.numbered_frames = any(not photo.stem.startswith("frame_") for photo in stored_frames)
+        self.next_frame_number = max(map(frame_number, stored_frames), default=0) + 1
         self.fps = fps
         self.exporter = exporter
         self.live_photo = None
@@ -116,8 +172,11 @@ class Studio:
         self.play_mode = None
         self.resume_mode = "all"
         self.export_job = None
+        self.join_dialog = None
+        self.narration_dialog = None
         self.ghost = False
         self.retake = False
+        self.confirming_removal = False
         self.held_keys = {}
         self.strip_start = None
         self.large_image = None
@@ -128,7 +187,7 @@ class Studio:
         self.text = "#f4f7fc"
         self.muted = "#bdcbe0"
         self.accent = "#82edcf"
-        root.title("Stop Motion Studio")
+        root.title(f"StopActionPi - {folder.name}")
         root.configure(bg=self.background)
         width = min(1050, root.winfo_screenwidth() - 40)
         height = min(810, root.winfo_screenheight() - 90)
@@ -187,10 +246,15 @@ class Studio:
     def update_controls(self):
         count = len(self.frames)
         self.count.configure(text=f"{count} photos  |  {count / self.fps:.1f} sec at {self.fps} fps")
+        if self.confirming_removal:
+            self.heading.configure(text=f"Remove photo {self.review_index + 1}?")
+            self.primary.configure(text="Enter  Remove photo     Esc  Keep photo")
+            self.secondary.configure(text="")
+            return
         if self.review_index is not None:
             title = {"all": "Playing movie", "recent": "Playing last few"}.get(self.play_mode, "Review photos")
             self.heading.configure(text=f"{title}   ·   {self.review_index + 1} / {count}")
-            self.primary.configure(text="Esc  Back to camera     ← →  Step through photos     Space  Pause / play")
+            self.primary.configure(text="Esc  Camera     ← →  Step     Space  Pause / play     Delete  Remove photo")
         elif self.retake:
             self.heading.configure(text=f"Retake photo {count}")
             self.primary.configure(text="Space  Save replacement     Esc  Cancel retake     O  Ghost overlay")
@@ -198,14 +262,12 @@ class Studio:
             title = "Live camera · Ghost overlay on" if self.ghost and self.last_photo is not None else "Live camera"
             self.heading.configure(text=title)
             self.primary.configure(text="Space  Take photo     O  Ghost overlay     ← →  Compare photos")
-        self.secondary.configure(text="P  Play movie     L  Loop last few     R  Retake last     E  Save MP4     Q  Quit")
+        self.secondary.configure(
+            text="P Play   L Loop   S Speed   R Retake   E Save MP4   J Join MP4s   I Join images   N Narrate   Q Quit"
+        )
 
     def photo_image(self, photo, width, height):
-        source_height, source_width = photo.shape[:2]
-        scale = min(width / source_width, height / source_height)
-        size = (max(1, int(source_width * scale)), max(1, int(source_height * scale)))
-        resized = cv2.resize(photo, size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-        _, ppm = cv2.imencode(".ppm", resized)
+        _, ppm = cv2.imencode(".ppm", resize_to_fit(photo, width, height))
         return self.tk.PhotoImage(master=self.root, data=ppm.tobytes(), format="PPM")
 
     def make_thumbnail(self, path):
@@ -271,10 +333,14 @@ class Studio:
         if self.live_photo is None:
             self.tell("Wait for the live camera image before taking a photo.")
             return
-        if self.last_photo is not None and self.last_photo.shape != self.live_photo.shape:
+        if not self.numbered_frames and self.last_photo is not None and self.last_photo.shape != self.live_photo.shape:
             self.tell("Camera size changed. Restore the original camera or start a new project.")
             return
-        path = self.frames[-1] if self.retake else self.folder / f"frame_{len(self.frames) + 1:06d}.png"
+        if self.retake:
+            path = self.frames[-1]
+        else:
+            name = f"{self.next_frame_number:03d}.png" if self.numbered_frames else f"frame_{self.next_frame_number:06d}.png"
+            path = self.folder / name
         try:
             save_photo(path, self.live_photo, replace=self.retake)
         except (ValueError, OSError, cv2.error) as error:
@@ -285,6 +351,7 @@ class Studio:
             self.thumbnail.cache_clear()
         else:
             self.frames.append(path)
+            self.next_frame_number += 1
         self.last_photo = self.live_photo
         self.retake = False
         self.strip_start = None
@@ -331,11 +398,10 @@ class Studio:
         self.stop_playback()
         self.play_mode = mode
         first = max(0, len(self.frames) - self.RECENT_COUNT) if mode == "recent" else 0
-        rate = min(self.fps, 6) if mode == "recent" else self.fps
         self.tell("Space pauses playback. Esc goes back to the camera.")
-        self.play_frame(first if start is None else start, first, rate, monotonic())
+        self.play_frame(first if start is None else start, first, monotonic())
 
-    def play_frame(self, index, first, rate, due):
+    def play_frame(self, index, first, due):
         self.play_job = None
         if index == len(self.frames):
             if self.play_mode == "recent":
@@ -347,9 +413,10 @@ class Studio:
                 self.tell("You're caught up. Esc goes back to the camera.")
                 return
         if self.show_photo(index):
+            rate = min(self.fps, 6) if self.play_mode == "recent" else self.fps
             next_due = due + 1 / rate
             delay = max(1, round((next_due - monotonic()) * 1000))
-            self.play_job = self.root.after(delay, self.play_frame, index + 1, first, rate, next_due)
+            self.play_job = self.root.after(delay, self.play_frame, index + 1, first, next_due)
 
     def back_to_camera(self):
         self.stop_playback()
@@ -373,12 +440,52 @@ class Studio:
         self.update_controls()
         self.tell("Set up the shot again. Space replaces the last photo. Esc keeps it.")
 
+    def ask_remove_photo(self):
+        if self.review_index is None:
+            self.tell("Use the arrow keys to find the photo you want to remove.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before removing a photo.")
+            return
+        self.stop_playback()
+        self.resume_mode = "all"
+        self.confirming_removal = True
+        self.update_controls()
+        self.tell("This photo will be left out of the movie.")
+
+    def remove_review_photo(self):
+        index = self.review_index
+        photo = self.frames[index]
+        destination = self.folder / REMOVED_DIR / photo.name
+        self.confirming_removal = False
+        new_last = self.last_photo
+        try:
+            if index == len(self.frames) - 1:
+                new_last = read_photo(self.frames[index - 1]) if index else None
+            destination.parent.mkdir(exist_ok=True)
+            if destination.exists():
+                raise FileExistsError(f"A removed copy of {photo.name} already exists.")
+            photo.rename(destination)
+        except (ValueError, OSError) as error:
+            self.update_controls()
+            self.tell("Could not remove the photo. See the terminal for details.")
+            print(error, file=sys.stderr)
+            return
+
+        del self.frames[index]
+        self.last_photo = new_last
+        self.thumbnail.cache_clear()
+        self.strip_start = None
+        if not self.frames or not self.show_photo(min(index, len(self.frames) - 1)):
+            self.back_to_camera()
+        self.tell(f"Photo {index + 1} removed from the movie.")
+
     def export(self):
         if not self.frames:
             self.tell("Take at least one photo before saving a movie.")
             return
         if self.export_job is None:
-            self.tell("Saving your MP4...")
+            self.tell(f"Saving your MP4 at {self.fps} fps...")
             self.export_job = self.exporter.submit(export_movie, self.folder, self.fps)
             self.root.after(100, self.check_export)
 
@@ -390,11 +497,29 @@ class Studio:
             output = self.export_job.result()
             self.tell(f"Movie saved! {output.name}")
             print(f"Movie: {output}")
-        except (ValueError, OSError) as error:
+        except (ValueError, OSError, cv2.error) as error:
             self.tell(str(error).splitlines()[0])
             print(error, file=sys.stderr)
         finally:
             self.export_job = None
+
+    def open_joiner(self, dialog):
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before joining clips.")
+            return
+        self.join_dialog = dialog(self.root, self.tk, self.folder, self.exporter, self.tell)
+
+    def open_narration(self):
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before recording narration.")
+            return
+        from narration_studio import NarrationDialog
+
+        self.stop_playback()
+        self.update_controls()
+        self.narration_dialog = NarrationDialog(
+            self.root, self.tk, self.folder, self.exporter, self.photo_image, self.tell,
+        )
 
     def key_pressed(self, event):
         key = event.keysym.lower()
@@ -405,6 +530,14 @@ class Studio:
                 self.held_keys[key] = None
             return "break"
         self.held_keys[key] = None
+        if self.confirming_removal:
+            if key in ("return", "kp_enter"):
+                self.remove_review_photo()
+            elif key == "escape":
+                self.confirming_removal = False
+                self.update_controls()
+                self.tell("Photo kept.")
+            return "break"
         if key == "space":
             if self.review_index is None:
                 self.capture()
@@ -428,12 +561,23 @@ class Studio:
                 self.tell("Ghost overlay on. Line up your next move.")
         elif key in ("left", "right"):
             self.step(-1 if key == "left" else 1)
+        elif key in ("delete", "kp_delete"):
+            self.ask_remove_photo()
         elif key in ("p", "l"):
             self.play("all" if key == "p" else "recent")
+        elif key == "s":
+            self.fps = 12 if self.fps == 6 else 6
+            self.update_controls()
         elif key == "r":
             self.start_retake()
         elif key == "e":
             self.export()
+        elif key == "j":
+            self.open_joiner(ClipJoinDialog)
+        elif key == "i":
+            self.open_joiner(ImageJoinDialog)
+        elif key == "n":
+            self.open_narration()
         elif key == "escape":
             self.back_to_camera()
         elif key == "q":
@@ -456,30 +600,22 @@ class Studio:
         if self.export_job is not None:
             self.tell("Your MP4 is still saving. Wait a moment before quitting.")
             return
+        if self.join_dialog is not None and self.join_dialog.job is not None:
+            self.join_dialog.close()
+            return
+        if self.narration_dialog is not None and self.narration_dialog.window.winfo_exists():
+            if not self.narration_dialog.close():
+                return
         self.stop_playback()
         self.root.after_cancel(self.camera_job)
         self.clear_held_keys()
         self.root.destroy()
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--project", type=Path, default=Path("projects") / datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
-    parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--fps", type=int, choices=range(1, 61), default=12, metavar="1-60")
-    parser.add_argument("--export-only", action="store_true", help="Export an existing project without opening the camera")
-    args = parser.parse_args()
-    folder = args.project.resolve()
-    if args.export_only:
-        print(export_movie(folder, args.fps))
-        return
-    try:
-        import tkinter as tk
-    except ImportError as error:
-        raise ValueError("The desktop interface needs Tk. Install it with: sudo apt install python3-tk") from error
+def run_studio(root, tk, folder, camera_index, fps):
     folder.mkdir(parents=True, exist_ok=True)
     frames = project_frames(folder)
-    camera = cv2.VideoCapture(args.camera, cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY)
+    camera = cv2.VideoCapture(camera_index, cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY)
     try:
         if not camera.isOpened():
             raise ValueError("Cannot open webcam. Close other camera apps or try --camera 1.")
@@ -488,15 +624,11 @@ def main():
             camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        try:
-            root = tk.Tk()
-        except tk.TclError as error:
-            raise ValueError(f"Could not open the studio window. Run from the Pi desktop: {error}") from error
         print(f"Project: {folder}")
         feed = CameraFeed(camera)
         try:
             with ThreadPoolExecutor(max_workers=1) as exporter:
-                Studio(root, tk, feed, folder, frames, args.fps, exporter)
+                Studio(root, tk, feed, folder, frames, fps, exporter)
                 root.mainloop()
         finally:
             feed.close()
@@ -504,9 +636,53 @@ def main():
         camera.release()
 
 
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--project", type=Path, help="Open this project folder directly")
+    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--fps", type=int, choices=range(1, 61), default=12, metavar="1-60")
+    parser.add_argument("--export-only", action="store_true", help="Export an existing project without opening the camera")
+    args = parser.parse_args()
+    if args.export_only:
+        if args.project is None:
+            parser.error("--export-only needs a --project folder")
+        print(export_movie(args.project.resolve(), args.fps))
+        return
+
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        from project_picker import ProjectPicker
+    except ImportError as error:
+        raise ValueError("The desktop interface needs Tk. Install it with: sudo apt install python3-tk") from error
+    try:
+        root = tk.Tk()
+    except tk.TclError as error:
+        raise ValueError(f"Could not open the studio window. Run from the Pi desktop: {error}") from error
+    try:
+        folder = args.project
+        if folder is None:
+            projects = Path(__file__).resolve().parent / "projects"
+            projects.mkdir(exist_ok=True)
+            folder = ProjectPicker(root, projects).choose()
+            if folder is None:
+                return
+        run_studio(root, tk, folder.resolve(), args.camera, args.fps)
+    except (ValueError, OSError, cv2.error) as error:
+        if args.project is None:
+            messagebox.showerror("StopActionPi", str(error), parent=root)
+        raise
+    finally:
+        # Studio normally destroys the window when the user quits.
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+
+
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, OSError) as error:
+    except (ValueError, OSError, cv2.error) as error:
         print(f"Error: {error}", file=sys.stderr)
         sys.exit(1)

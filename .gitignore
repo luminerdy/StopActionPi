@@ -1,5 +1,10 @@
 __pycache__/
+/.venv/
+/screenshots/
+/HANDOFF.md
 projects/
+joined_images_*/
+.removed/
 *.mp4
 frame_*.png
 .env
