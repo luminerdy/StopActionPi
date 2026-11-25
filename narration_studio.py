@@ -11,12 +11,14 @@ import wave
 import cv2
 
 from narration import load_voice_track, microphone_source, mux_narration, replace_section, save_narrated_movie, start_recording
+from ui_controls import ButtonRow, set_button_label, shortcut_button
 
 
 class NarrationDialog:
     LEAD_IN = 3
 
     def __init__(self, root, tk, folder, executor, render, notify):
+        self.parent = root
         self.folder, self.executor, self.render, self.notify = folder, executor, render, notify
         self.temp = TemporaryDirectory(prefix="stopactionpi-narration-")
         directory = Path(self.temp.name)
@@ -33,41 +35,45 @@ class NarrationDialog:
         self.window.title("Recording Studio")
         self.window.transient(root)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
-        body = tk.Frame(self.window, padx=12, pady=10)
+        self.window.minsize(min(770, self.window.winfo_screenwidth() - 40), 1)
+        background, foreground = "#202a39", "#f4f7fc"
+        body = tk.Frame(self.window, padx=12, pady=10, bg=background)
         body.pack(fill="both", expand=True)
-        self.picture = tk.Label(body, text="Choose a finished MP4.", width=48, height=8, bg="#141a24", fg="#f4f7fc")
+        self.picture = tk.Label(body, text="Choose a movie to add your voice.", width=48, height=8, bg="#141a24", fg=foreground)
         self.picture.pack(pady=(0, 6))
-        self.timeline = tk.Canvas(body, height=22, bg="#202a39", highlightthickness=0)
+        self.timeline = tk.Canvas(body, height=22, bg="#141a24", highlightthickness=0)
         self.timeline.pack(fill="x")
         self.timeline.bind("<Configure>", lambda event: self.update_timeline())
         for event in ("<Button-1>", "<B1-Motion>"):
             self.timeline.bind(event, self.seek_from_pointer)
-        self.times = tk.Label(body, text="Arrow keys move one frame at a time.", anchor="w")
+        self.times = tk.Label(body, text="Arrow keys move one frame at a time.", anchor="w", bg=background, fg=foreground)
         self.times.pack(fill="x", pady=(2, 5))
 
-        cue_row = tk.Frame(body)
+        cue_row = tk.Frame(body, bg=background)
         cue_row.pack(fill="x")
-        tk.Label(cue_row, text="Cue line (optional)").pack(side="left")
+        tk.Label(cue_row, text="What will you say?", bg=background, fg=foreground).pack(side="left")
         self.cue = tk.Entry(cue_row, font=("TkDefaultFont", 13))
         self.cue.pack(side="left", fill="x", expand=True, padx=(6, 0))
 
-        self.status = tk.Label(body, text="Open a movie, then set the start and end of your line.", anchor="w", wraplength=550)
+        self.status = tk.Label(body, text="Choose a movie, then pick where your line starts and ends.", anchor="w",
+                               wraplength=550, bg=background, fg=foreground)
         self.status.pack(fill="x", pady=6)
         self.buttons = {}
-        for row in (
-            (("a", "A  Choose MP4", self.choose), ("1", "1  Set Start", self.set_start),
-             ("2", "2  Set End", self.set_end), ("t", "T  Rehearse", self.rehearse),
-             ("r", "R  Record Part", self.record), ("s", "S  Stop", self.stop)),
-            (("p", "P  Listen Back", self.preview), ("k", "K  Keep Take", self.keep),
-             ("x", "X  Discard Take", self.discard), ("e", "E  Save MP4", self.save),
-             ("escape", "Esc  Close", self.close)),
+        self.action_rows = []
+        for actions in (
+            (("a", "Choose Movie", "A", self.choose), ("1", "Start Here", "1", self.set_start),
+             ("2", "End Here", "2", self.set_end), ("t", "Practice", "T", self.rehearse),
+             ("r", "Record This Part", "R", self.record), ("s", "Stop", "S", self.stop)),
+            (("p", "Listen Back", "P", self.preview), ("k", "Keep This Take", "K", self.keep),
+             ("x", "Discard This Take", "X", self.discard), ("e", "Save Movie", "E", self.save),
+             ("escape", "Close", "Esc", self.close)),
         ):
-            bar = tk.Frame(body)
-            bar.pack(fill="x", pady=2)
-            for key, name, action in row:
-                button = tk.Button(bar, text=name, command=action)
-                button.pack(side="left", padx=(0, 4))
-                self.buttons[key] = button
+            row = ButtonRow(tk, body, background)
+            row.frame.pack(fill="x", pady=3)
+            for key, name, hint, action in actions:
+                tone = "primary" if key in ("r", "k") else "normal"
+                self.buttons[key] = shortcut_button(tk, row.frame, name, hint, action, tone=tone)
+            self.action_rows.append((row, tuple(action[0] for action in actions)))
         self.controls()
         self.window.bind("<KeyPress>", self.key_pressed)
         self.window.wait_visibility()
@@ -84,12 +90,15 @@ class NarrationDialog:
         idle = self.idle()
         ready = idle and self.working.is_file()
         pending = ready and self.candidate.is_file()
+        set_button_label(self.buttons["r"], "Try Again" if pending else "Record This Part")
         for key, enabled in {
             "a": idle, "1": ready and not pending, "2": ready and not pending, "t": ready,
             "r": ready, "s": self.mode is not None, "p": ready, "k": pending, "x": pending,
             "e": ready and self.dirty and not pending, "escape": True,
         }.items():
             self.buttons[key].configure(state="normal" if enabled else "disabled")
+        for row, keys in self.action_rows:
+            row.show(self.buttons[key] for key in keys if key != "s" or not idle)
 
     def key_pressed(self, event):
         key = event.keysym.lower()
@@ -160,7 +169,7 @@ class NarrationDialog:
         self.run_job(load_voice_track, "Opening audio track...", self.movie_opened, movie, self.frames / fps, self.working)
 
     def movie_opened(self, output):
-        self.tell("Use the arrows or timeline, then press 1 and 2 to mark your section.")
+        self.tell("Move along the timeline. Use Start Here and End Here to mark your line.")
 
     def set_start(self):
         if self.position >= self.end:
@@ -182,7 +191,7 @@ class NarrationDialog:
         self.clock_start = monotonic()
         self.first = max(0, self.start - round(self.LEAD_IN * self.fps))
         self.controls()
-        self.tell("Rehearsing the section. The microphone is off.")
+        self.tell("Practice your line. The microphone is off.")
         self.play_tick()
 
     def record(self):
@@ -212,7 +221,7 @@ class NarrationDialog:
             self.seek(min(frame, self.end))
             if frame >= self.end:
                 self.mode = None
-                self.tell("Rehearsal finished. Press R when you're ready to record.")
+                self.tell("Ready to record? Choose Record This Part.")
                 self.controls()
                 return
         self.play_job = self.window.after(20, self.play_tick)
@@ -279,7 +288,7 @@ class NarrationDialog:
             self.controls()
 
     def take_ready(self, output):
-        self.tell("Take ready. P listens, K keeps it, R tries again, and X discards it.")
+        self.tell("Take ready. Listen back, keep this take, or try again.")
 
     def keep(self):
         try:
@@ -370,4 +379,5 @@ class NarrationDialog:
             self.reader.release()
         self.temp.cleanup()
         self.window.destroy()
+        self.parent.focus_set()
         return True

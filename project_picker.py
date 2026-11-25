@@ -4,6 +4,8 @@ import tkinter as tk
 from tkinter import filedialog, simpledialog
 from pathlib import Path
 
+from ui_controls import shortcut_button
+
 
 class ProjectPicker:
     def __init__(self, root, projects):
@@ -18,73 +20,87 @@ class ProjectPicker:
         )
 
         root.title("StopActionPi")
-        root.geometry(f"{min(680, root.winfo_screenwidth() - 36)}x{min(490, root.winfo_screenheight() - 76)}")
+        rows = min(len(self.recent), 6)
+        width = min(680, root.winfo_screenwidth() - 36)
+        height = min(245 + rows * 30, root.winfo_screenheight() - 76)
+        root.geometry(f"{width}x{height}")
         root.protocol("WM_DELETE_WINDOW", self.finish)
 
         self.body = tk.Frame(root, padx=22, pady=18, bg="#202a39")
         self.body.pack(fill="both", expand=True)
         tk.Label(self.body, text="StopActionPi", font=("TkDefaultFont", 24, "bold"),
                  bg="#202a39", fg="#f4f7fc").pack(anchor="w")
-        tk.Label(self.body, text="Choose a movie to continue or start a new one.",
+        tk.Label(self.body, text="Pick the movie you want to keep working on." if self.recent else "Ready to make your first movie?",
                  font=("TkDefaultFont", 12), bg="#202a39", fg="#bdcbe0").pack(anchor="w", pady=(4, 12))
 
-        actions = tk.Frame(self.body, bg="#202a39")
-        actions.pack(fill="x", pady=(0, 12))
-        for label, command in (("N  New Movie", self.new_movie), ("O  Open Folder", self.open_folder)):
-            tk.Button(actions, text=label, command=command, padx=12, pady=6,
-                      font=("TkDefaultFont", 13, "bold")).pack(side="left", padx=(0, 8))
-
-        tk.Label(self.body, text="Recent projects", font=("TkDefaultFont", 13, "bold"),
-                 bg="#202a39", fg="#f4f7fc").pack(anchor="w", pady=(0, 4))
-        recent_area = tk.Frame(self.body, bg="#202a39")
-        recent_area.pack(fill="both", expand=True)
-        scrollbar = tk.Scrollbar(recent_area, orient="vertical")
-        scrollbar.pack(side="right", fill="y")
-        self.listbox = tk.Listbox(recent_area, height=6, exportselection=False,
-                                  font=("TkDefaultFont", 13), yscrollcommand=scrollbar.set)
-        self.listbox.pack(side="left", expand=True, fill="both")
-        scrollbar.configure(command=self.listbox.yview)
-        for path in self.recent:
-            self.listbox.insert("end", path.name)
+        self.listbox = None
         if self.recent:
+            tk.Label(self.body, text="Recent Movies", font=("TkDefaultFont", 13, "bold"),
+                     bg="#202a39", fg="#f4f7fc").pack(anchor="w", pady=(0, 4))
+            recent_area = tk.Frame(self.body, bg="#202a39")
+            recent_area.pack(fill="both", expand=True)
+            scrollbar = tk.Scrollbar(recent_area, orient="vertical")
+            if len(self.recent) > rows:
+                scrollbar.pack(side="right", fill="y")
+            self.listbox = tk.Listbox(recent_area, height=rows, exportselection=False, bg="#141a24", fg="#f4f7fc",
+                                      selectbackground="#82edcf", selectforeground="#142a27", activestyle="none",
+                                      font=("TkDefaultFont", 13), yscrollcommand=scrollbar.set)
+            self.listbox.pack(side="left", expand=True, fill="both")
+            scrollbar.configure(command=self.listbox.yview)
+            for path in self.recent:
+                self.listbox.insert("end", path.name)
             self.listbox.selection_set(0)
             self.listbox.activate(0)
-        self.listbox.bind("<Double-Button-1>", lambda event: self.continue_movie())
+            self.listbox.bind("<Double-Button-1>", lambda event: self.continue_movie())
+
+        self.status = tk.Label(self.body, anchor="w", bg="#202a39", fg="#bdcbe0", wraplength=width - 48)
+        self.status.pack(fill="x", pady=(5, 4))
+        if self.listbox is not None:
+            self.continue_button = shortcut_button(tk, self.body, "Continue Selected Movie", "Enter",
+                                                   self.continue_movie, tone="primary", large=True)
+            self.continue_button.pack(fill="x")
+            self.listbox.bind("<<ListboxSelect>>", self.selection_changed)
+            self.selection_changed()
 
         footer = tk.Frame(self.body, bg="#202a39")
         footer.pack(fill="x", pady=(10, 0))
-        tk.Button(footer, text="Enter  Continue", command=self.continue_movie,
-                  state="normal" if self.recent else "disabled").pack(side="left")
-        tk.Button(footer, text="Esc  Quit", command=self.finish).pack(side="right")
-        self.status = tk.Label(self.body, text="Use the arrow keys to choose a recent project."
-                               if self.recent else "Press N to make your first movie.",
-                               anchor="w", bg="#202a39", fg="#bdcbe0", wraplength=500)
-        self.status.pack(fill="x", pady=(6, 0))
+        self.new_button = shortcut_button(tk, footer, "New Movie", "N", self.new_movie,
+                                          tone="normal" if self.recent else "primary", large=not self.recent)
+        self.new_button.pack(side="left", padx=(0, 8))
+        shortcut_button(tk, footer, "Open Movie Folder", "O", self.open_folder).pack(side="left")
+        shortcut_button(tk, footer, "Quit", "Esc", self.finish).pack(side="right")
 
         self.key_binding = root.bind("<KeyPress>", self.key_pressed)
-        self.listbox.focus_set()
+        (self.listbox if self.listbox is not None else self.new_button).focus_set()
 
     def choose(self):
         self.root.wait_variable(self.done)
         self.root.unbind("<KeyPress>", self.key_binding)
         self.root.protocol("WM_DELETE_WINDOW", self.root.destroy)
         self.body.destroy()
+        self.root.focus_set()
         return self.folder
 
     def finish(self, folder=None):
         self.folder = folder
         self.done.set(True)
 
+    def selection_changed(self, event=None):
+        selection = self.listbox.curselection()
+        self.continue_button.configure(state="normal" if selection else "disabled")
+        self.status.configure(text=f"Selected movie: {self.recent[selection[0]].name}" if selection else "Pick a movie from the list.")
+
     def continue_movie(self):
+        if self.listbox is None:
+            self.new_movie()
+            return
         selection = self.listbox.curselection()
         if selection:
             folder = self.recent[selection[0]]
             if folder.is_dir():
                 self.finish(folder)
             else:
-                self.status.configure(text="That project moved. Use Open Folder to find it.")
-        elif not self.recent:
-            self.new_movie()
+                self.status.configure(text="That movie moved. Use Open Movie Folder to find it.")
 
     def new_movie(self):
         name = simpledialog.askstring("New Movie", "Give your movie a name.", parent=self.root)

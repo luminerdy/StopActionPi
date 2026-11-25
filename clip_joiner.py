@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from tempfile import TemporaryDirectory
 
+from ui_controls import ButtonRow, shortcut_button
+
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
@@ -81,6 +83,7 @@ def join_image_folders(folders, folder):
 
 class JoinDialog:
     def __init__(self, parent, tk, folder, exporter, notify):
+        self.parent = parent
         self.folder = folder
         self.exporter = exporter
         self.notify = notify
@@ -90,37 +93,41 @@ class JoinDialog:
 
         self.window = tk.Toplevel(parent)
         self.window.title(self.title)
+        self.window.geometry(f"{min(740, self.window.winfo_screenwidth() - 36)}x{min(350, self.window.winfo_screenheight() - 60)}")
         self.window.transient(parent)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
-        body = tk.Frame(self.window, padx=14, pady=12)
+        background, foreground = "#202a39", "#f4f7fc"
+        body = tk.Frame(self.window, padx=14, pady=12, bg=background)
         body.pack(fill="both", expand=True)
         for instruction in self.instructions:
-            tk.Label(body, text=instruction).pack(anchor="w")
+            tk.Label(body, text=instruction, bg=background, fg=foreground).pack(anchor="w")
 
         clip_list = tk.Frame(body)
         clip_list.pack(fill="both", expand=True, pady=8)
         scrollbar = tk.Scrollbar(clip_list, orient="vertical")
         scrollbar.pack(side="right", fill="y")
-        self.listbox = tk.Listbox(clip_list, width=65, height=7, exportselection=False, yscrollcommand=scrollbar.set)
+        self.listbox = tk.Listbox(clip_list, width=65, height=7, exportselection=False, yscrollcommand=scrollbar.set,
+                                  bg="#141a24", fg=foreground, selectbackground="#82edcf", selectforeground="#142a27")
         self.listbox.pack(side="left", fill="both", expand=True)
         scrollbar.configure(command=self.listbox.yview)
 
-        actions = tk.Frame(body)
-        actions.pack(fill="x")
+        actions = ButtonRow(tk, body, background)
+        actions.frame.pack(fill="x")
         self.buttons = []
-        for label, action in (
-            (self.add_label, self.add_item),
-            ("U  Move up", self.move_up),
-            ("D  Move down", self.move_down),
-            ("Delete  Remove", self.remove_item),
-            ("Enter  Join", self.join),
+        for label, key, action, tone in (
+            (self.add_label, "A", self.add_item, "primary"),
+            ("Move Up", "U", self.move_up, "normal"),
+            ("Move Down", "D", self.move_down, "normal"),
+            ("Take Off List", "Delete", self.remove_item, "normal"),
+            (self.title, "Enter", self.join, "normal"),
         ):
-            button = tk.Button(actions, text=label, command=action)
-            button.pack(side="left", padx=(0, 4))
+            button = shortcut_button(tk, actions.frame, label, key, action, tone=tone)
             self.buttons.append(button)
-        tk.Button(actions, text="Esc  Close", command=self.close).pack(side="right")
-        self.status = tk.Label(body, text=self.empty_message, anchor="w", justify="left", wraplength=500)
+        close_button = shortcut_button(tk, actions.frame, "Close", "Esc", self.close)
+        actions.show((*self.buttons, close_button))
+        self.status = tk.Label(body, text=self.empty_message, anchor="w", justify="left", wraplength=500,
+                               bg=background, fg=foreground)
         self.status.pack(fill="x", pady=(8, 0))
 
         self.window.bind("<KeyPress>", self.key_pressed)
@@ -219,16 +226,17 @@ class JoinDialog:
             self.tell("Still saving. Wait a moment before closing.")
         else:
             self.window.destroy()
+            self.parent.focus_set()
 
 
 class ClipJoinDialog(JoinDialog):
-    title = "Join MP4s"
+    title = "Join Movies"
     instructions = (
         "Add clips in the order you want them to play.",
         "The studio saves a new silent movie in your current project.",
     )
-    add_label = "A  Add MP4"
-    empty_message = "Add at least two MP4 clips."
+    add_label = "Add Movie"
+    empty_message = "Add at least two movies."
     item_label = "clips"
     saved_label = "Movie"
     minimum = 2
@@ -244,12 +252,12 @@ class ClipJoinDialog(JoinDialog):
 
 
 class ImageJoinDialog(JoinDialog):
-    title = "Join Image Folders"
+    title = "Join Photo Folders"
     instructions = (
         "Add photo folders in the order you want them joined.",
         "The studio makes a new folder in your current project, numbered from 000.",
     )
-    add_label = "A  Add folder"
+    add_label = "Add Folder"
     empty_message = "Add at least one photo folder."
     item_label = "folders"
     saved_label = "Images"

@@ -5,6 +5,7 @@ __pycache__/
 projects/
 joined_images_*/
 .removed/
+.transitions.json
 *.mp4
 frame_*.png
 .env

@@ -8,6 +8,9 @@ import sys
 
 
 MANAGED = "# Managed by StopActionPi install_desktop.py"
+APP_ENTRY = "stopactionpi.desktop"
+OPEN_URI = "stopactionpi://open"
+URI_TYPE = "x-scheme-handler/stopactionpi"
 
 
 def desktop_arg(path):
@@ -29,6 +32,8 @@ def desktop_directory():
 
 
 def install_desktop():
+    if not shutil.which("gio"):
+        raise ValueError("The desktop shortcut needs Gio. Install it with sudo apt install libglib2.0-bin.")
     project = Path(__file__).resolve().parent
     script = project / "stop_motion.py"
     if not script.is_file():
@@ -37,8 +42,8 @@ def install_desktop():
     python = environment_python if environment_python.is_file() else Path(sys.executable)
     data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    desktop_icon = desktop_directory() / "stopactionpi.desktop"
-    launchers = (data / "applications" / "stopactionpi.desktop", config / "autostart" / "stopactionpi.desktop", desktop_icon)
+    desktop_icon = desktop_directory() / APP_ENTRY
+    app_launchers = (data / "applications" / APP_ENTRY, config / "autostart" / APP_ENTRY)
     working_directory = str(project).replace("\\", "\\\\")
     content = f"""{MANAGED}
 [Desktop Entry]
@@ -50,16 +55,29 @@ Path={working_directory}
 Icon=camera-photo
 Terminal=false
 Categories=AudioVideo;Video;
+MimeType={URI_TYPE};
 """
-    for launcher in launchers:
+    # PCManFM opens links through the app's URI handler without treating them as executable files.
+    desktop_link = f"""{MANAGED}
+[Desktop Entry]
+Type=Link
+Name=StopActionPi
+Comment=Make a stop motion movie
+Icon=camera-photo
+URL={OPEN_URI}
+"""
+    for launcher in (*app_launchers, desktop_icon):
         if launcher.is_symlink() or (launcher.exists() and not launcher.read_text(encoding="utf-8").startswith(MANAGED)):
             raise ValueError(f"An existing launcher needs review: {launcher}")
-    for launcher in launchers:
+    for launcher in app_launchers:
         launcher.parent.mkdir(parents=True, exist_ok=True)
         launcher.write_text(content, encoding="utf-8")
-        if launcher == desktop_icon:
-            launcher.chmod(0o755)
         print(launcher)
+    subprocess.run(["gio", "mime", URI_TYPE, APP_ENTRY], check=True)
+    desktop_icon.parent.mkdir(parents=True, exist_ok=True)
+    desktop_icon.write_text(desktop_link, encoding="utf-8")
+    desktop_icon.chmod(0o644)
+    print(desktop_icon)
 
 
 if __name__ == "__main__":

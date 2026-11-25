@@ -14,38 +14,56 @@ Connect the webcam to USB. From a terminal on the Pi desktop, run:
 
 ```bash
 sudo apt update
-sudo apt install git python3-opencv python3-tk ffmpeg v4l-utils
+sudo apt install git python3-opencv python3-tk ffmpeg v4l-utils libglib2.0-bin
 git clone https://github.com/luminerdy/StopActionPi.git
 cd StopActionPi
 python3 install_desktop.py
 ```
 
-Open **StopActionPi** from its desktop icon or the application menu. The app also opens when your desktop session starts. On a Pi with Desktop Auto Login enabled, this happens at boot. The launcher uses a project `.venv` if present, or the system Python with the packages above.
+Double-click the **StopActionPi** desktop icon or choose it from the application menu. The app also opens when your desktop session starts. On a Pi with Desktop Auto Login enabled, this happens at boot. The launcher uses a project `.venv` if present, or the system Python with the packages above.
 
-On the welcome screen, choose **New Movie** and give it a name, select a recent project and press **Enter**, or choose **Open Folder** to find an existing project anywhere on the Pi. New movies go under `projects/` in the app folder. The camera opens after you pick a folder. To try the app without creating launchers, run `python3 stop_motion.py` from a terminal on the Pi desktop.
+On the welcome screen, pick a recent movie and choose **Continue Selected Movie**. Choose **New Movie** to start another one or **Open Movie Folder** to find a project elsewhere on the Pi. New movies go under `projects/` in the app folder. The studio goes fullscreen after you pick a folder. Choose **Window View** or press **F11** to switch between full screen and a window. To try the app without creating launchers, run `python3 stop_motion.py` from a terminal on the Pi desktop.
+
+To update an installation made with Git, quit StopActionPi, open a terminal in the app folder, and run:
+
+```bash
+git pull --ff-only
+python3 install_desktop.py
+```
+
+Running the installer again refreshes the desktop shortcut, menu entry, and autostart entry.
 
 ## Make a movie
 
-Fix the camera in place, light the scene, and press **Space** for the first photo. Move your subject a little and press **Space** again. Once you have three photos, press **P** to watch them move and **E** to make your first MP4. The newest photos appear below the live view as you go.
+Fix the camera in place and light the scene. Click **Take Photo** or press **Space** for the first photo. Move your subject a little and take another one. Once you have three photos, choose **Play Movie** or press **P** to watch them move, then choose **Save Movie** or press **E** to save an MP4. The buttons change as you move between the camera, photo review, and retake screens. Each shows the key that does the same thing.
 
 | Key | What it does |
 | --- | --- |
 | **Space** | Take and save a photo in the live view. Pause or play in review. |
-| **O** | Toggle a faint overlay of the last photo so you can see what moved. |
+| **O** | Show or hide a faint copy of the last photo so you can see what moved. |
 | **← / →** | Open the latest saved photo, then step through the photos one by one. |
 | **Delete** | Remove the photo shown in review. Press **Enter** to remove it or **Esc** to keep it. |
+| **F** | Add or edit a fade from the selected photo into the next one. |
 | **P** | Play the movie from the first photo through the newest one. |
-| **L** | Loop up to six recent photos slowly to check the motion. |
+| **L** | Replay the last six photos slowly to check the motion. |
 | **S** | Switch between 6 fps and 12 fps for full playback and the next MP4 export. The current speed is displayed at the top. |
 | **Esc** | Return to the live camera or cancel a retake. |
 | **R** | Set up a retake. **Space** replaces the last photo and **Esc** keeps it. |
-| **E** | Save an MP4 in the project folder. Wait for “Movie saved!” on screen. |
+| **E** | Save Movie creates an MP4 in the project folder. Wait for “Movie saved!” on screen. |
+| **M** | Show or hide Movie Tools for joining movies, joining photo folders, or adding your voice. |
 | **J** | Join two or more saved MP4s into one movie. |
 | **I** | Copy photos from one or more folders into a new numbered sequence. |
 | **N** | Record narration for a finished MP4 using a connected microphone. |
+| **F11** | Switch between full screen and window view. |
 | **Q** | Quit. Your photos are already saved. |
 
-The same 60 photos make a 5-second movie at 12 fps or a 10-second movie at 6 fps. **Space** saves one photo at either speed. Try small, consistent movements and keep your hands out of the scene when you press Space.
+With straight cuts, 60 photos make a 5-second movie at 12 fps or a 10-second movie at 6 fps. **Space** saves one photo at either speed. Try small, consistent movements and keep your hands out of the scene when you press Space.
+
+## Fade between photos
+
+In review, use the arrow keys to pick the photo where the fade should begin. Press **F** and enter the number of seconds. The fade blends that photo into the next one and adds that time to the movie, rounded to the nearest frame. Press **Space** to preview from the selected photo, **P** to play the full movie, or **E** to export it with the fade.
+
+Fades are saved with the project. Press **F** again to change a fade, or enter `0` to remove it. Your original photos stay intact. Removing either photo skips the fade.
 
 ## Join finished movies
 
@@ -59,11 +77,11 @@ Press **I**, then **A** for each image folder you want to add. The studio reads 
 
 Press **Enter** to create a new `joined_images_*` folder inside your current project. Photos are copied with their original formats, starting at `000` and counting up across all the selected folders. The join includes PNG, JPEG, BMP, TIFF, and WebP photos directly inside each folder.
 
-To review the joined sequence or turn it into an MP4, reopen StopActionPi and choose **Open Folder**. Select the new `joined_images_*` folder inside the original project.
+To review the joined sequence or turn it into an MP4, reopen StopActionPi and choose **Open Movie Folder**. Select the new `joined_images_*` folder inside the original project.
 
 ## Recording Studio
 
-Finish and export your movie. If you're making it from several MP4s, join them before recording. Press **N** to open the **Recording Studio**, then **A** to choose the MP4. You can start with a silent movie or reopen one with narration already on it.
+Finish and export your movie. If you're making it from several MP4s, join them before recording. Open **Movie Tools** and choose **Add My Voice**, or press **N**. Choose your movie with **A**. You can start with a silent movie or reopen one with narration already on it.
 
 1. Use the arrow keys or click the timeline to find the start. Press **1** to mark it. Find the end and press **2**. Leave the marks as they are to record the whole movie. Type an optional cue line in the text box.
 2. Press **T** to rehearse with up to three seconds of lead-in. Press **R** to record the section after a countdown. Speak when you see “Recording.” The take stops at the end of the section, or press **S** to stop early.
@@ -74,7 +92,7 @@ The app prefers the Logitech C270 microphone when it finds one in the Pi desktop
 
 ## Resume or change playback speed
 
-Quit with **Q** and open StopActionPi again. Choose the same movie on the welcome screen to reload your photos. The app starts at 12 fps, and **S** switches the speed during a session. For terminal use from the Pi desktop, `--project` skips the welcome screen and `--fps` picks the starting speed. Open each project in one window at a time.
+Quit with **Q** and open StopActionPi again. Choose the same movie on the welcome screen to reload your photos. The app starts at 6 fps, and **S** switches between 6 and 12 fps during a session. For terminal use from the Pi desktop, `--project` skips the welcome screen and `--fps` picks the starting speed. Open each project in one window at a time.
 
 ```bash
 python3 stop_motion.py --project projects/first_movie --fps 8

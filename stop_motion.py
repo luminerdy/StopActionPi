@@ -8,13 +8,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory, TemporaryFile
 from threading import Event, Thread
 from time import monotonic
 
 import cv2
 
 from clip_joiner import IMAGE_SUFFIXES, ClipJoinDialog, ImageJoinDialog
+from transitions import MAX_FADE_SECONDS, blend_frame, fade_frame_count, neighbor_pair, project_fades, save_fades
+from ui_controls import ButtonRow, set_button_label, shortcut_button
 
 
 REMOVED_DIR = ".removed"
@@ -56,44 +58,78 @@ def export_movie(folder, fps):
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output = folder / f"movie_{stamp}_{fps}fps.mp4"
     partial = folder / f"movie_{stamp}.partial.mp4"
-    command = [
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-n",
-        "-framerate", str(fps), "-start_number", "1",
-        "-i", "frame_%06d.png",
-        "-frames:v", str(len(frames)),
+    output_options = [
         "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
     ]
     try:
-        # FFmpeg expects consecutive filenames. Keep the saved photos in place.
-        with TemporaryDirectory(prefix=".export-", dir=folder) as directory:
-            numbered = any(not photo.stem.startswith("frame_") for photo in frames)
-            if numbered:
-                height, width = read_photo(frames[0]).shape[:2]
-            for number, photo in enumerate(frames, start=1):
-                staged = Path(directory) / f"frame_{number:06d}.png"
-                if numbered:
-                    image = resize_to_fit(read_photo(photo), width, height)
-                    vertical = height - image.shape[0]
-                    horizontal = width - image.shape[1]
-                    image = cv2.copyMakeBorder(
-                        image, vertical // 2, vertical - vertical // 2,
-                        horizontal // 2, horizontal - horizontal // 2, cv2.BORDER_CONSTANT,
-                    )
-                    save_photo(staged, image)
-                else:
-                    try:
-                        staged.hardlink_to(photo)
-                    except OSError:
-                        shutil.copyfile(photo, staged)
-            subprocess.run(command, cwd=directory, check=True, capture_output=True, text=True)
+        fades = project_fades(folder, frames)
+        if fades:
+            export_with_fades(frames, fades, fps, output_options)
+        else:
+            export_photo_sequence(folder, frames, fps, output_options)
         partial.rename(output)
     except subprocess.CalledProcessError as error:
         raise ValueError(f"Export failed: {error.stderr.strip()}") from error
     finally:
         partial.unlink(missing_ok=True)
     return output
+
+
+def export_photo_sequence(folder, frames, fps, output_options):
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-n",
+        "-framerate", str(fps), "-start_number", "1", "-i", "frame_%06d.png",
+        "-frames:v", str(len(frames)), *output_options,
+    ]
+    # FFmpeg expects consecutive filenames. Keep the saved photos in place.
+    with TemporaryDirectory(prefix=".export-", dir=folder) as directory:
+        numbered = any(not photo.stem.startswith("frame_") for photo in frames)
+        if numbered:
+            height, width = read_photo(frames[0]).shape[:2]
+        for number, photo in enumerate(frames, start=1):
+            staged = Path(directory) / f"frame_{number:06d}.png"
+            if numbered:
+                save_photo(staged, fit_movie_frame(read_photo(photo), width, height))
+            else:
+                try:
+                    staged.hardlink_to(photo)
+                except OSError:
+                    shutil.copyfile(photo, staged)
+        subprocess.run(command, cwd=directory, check=True, capture_output=True, text=True)
+
+
+def export_with_fades(frames, fades, fps, output_options):
+    previous = read_photo(frames[0])
+    height, width = previous.shape[:2]
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-n", "-nostdin",
+        "-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{width}x{height}",
+        "-framerate", str(fps), "-i", "pipe:0", *output_options,
+    ]
+    # Stream the blends so a long fade does not fill the project with temporary PNGs.
+    with TemporaryFile() as errors, subprocess.Popen(command, stdin=subprocess.PIPE, stderr=errors) as encoder:
+        interrupted = False
+        try:
+            with encoder.stdin as pipe:
+                pipe.write(previous.tobytes())
+                for index, photo in enumerate(frames[1:]):
+                    current = fit_movie_frame(read_photo(photo), width, height)
+                    count = fade_frame_count(fades.get(neighbor_pair(frames, index), 0), fps)
+                    for step in range(1, count + 1):
+                        pipe.write(blend_frame(previous, current, step, count).tobytes())
+                    pipe.write(current.tobytes())
+                    previous = current
+        except BrokenPipeError:
+            interrupted = True
+        except BaseException:
+            encoder.kill()
+            raise
+        if encoder.wait() or interrupted:
+            errors.seek(0)
+            detail = errors.read().decode(errors="replace").strip()
+            raise ValueError(f"Export failed: {detail or 'FFmpeg closed the video stream early.'}")
 
 
 def read_photo(path):
@@ -108,6 +144,16 @@ def resize_to_fit(photo, width, height):
     scale = min(width / source_width, height / source_height)
     size = (max(1, int(source_width * scale)), max(1, int(source_height * scale)))
     return cv2.resize(photo, size, interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+
+
+def fit_movie_frame(photo, width, height):
+    if photo.shape[:2] == (height, width):
+        return photo
+    image = resize_to_fit(photo, width, height)
+    vertical = height - image.shape[0]
+    horizontal = width - image.shape[1]
+    return cv2.copyMakeBorder(image, vertical // 2, vertical - vertical // 2,
+                              horizontal // 2, horizontal - horizontal // 2, cv2.BORDER_CONSTANT)
 
 
 def save_photo(path, photo, *, replace=False):
@@ -159,6 +205,7 @@ class Studio:
         self.feed = feed
         self.folder = folder
         self.frames = frames
+        self.fades = project_fades(folder, frames)
         stored_frames = frames + project_frames(folder / REMOVED_DIR)
         self.numbered_frames = any(not photo.stem.startswith("frame_") for photo in stored_frames)
         self.next_frame_number = max(map(frame_number, stored_frames), default=0) + 1
@@ -168,6 +215,7 @@ class Studio:
         self.last_photo = read_photo(frames[-1]) if frames else None
         self.review_index = None
         self.review_photo = None
+        self.blended_photo = None
         self.play_job = None
         self.play_mode = None
         self.resume_mode = "all"
@@ -177,9 +225,11 @@ class Studio:
         self.ghost = False
         self.retake = False
         self.confirming_removal = False
+        self.tools_open = False
         self.held_keys = {}
         self.strip_start = None
         self.large_image = None
+        self.resize_job = None
         self.thumbnail = lru_cache(maxsize=24)(self.make_thumbnail)
 
         self.background = "#141a24"
@@ -206,7 +256,6 @@ class Studio:
         self.viewport.pack_propagate(False)
         self.picture = tk.Label(self.viewport, text="Starting camera...", bg="#0a0f17", fg=self.text)
         self.picture.pack(fill="both", expand=True)
-        self.viewport.bind("<Configure>", self.update_picture)
 
         self.status = self.label(root, "Move your subject a little, then press Space.", size=13, bold=True)
         self.status.pack(fill="x", padx=18, pady=(4, 2))
@@ -221,14 +270,12 @@ class Studio:
             number.pack()
             self.slots.append((tile, thumb, number))
 
-        self.primary = self.label(root, "", size=13, bold=True)
-        self.primary.pack(fill="x", padx=18, pady=(6, 0))
-        self.secondary = self.label(root, "", size=11)
-        self.secondary.pack(fill="x", padx=18, pady=(1, 9))
+        self.build_action_buttons()
 
         root.bind("<KeyPress>", self.key_pressed)
         root.bind("<KeyRelease>", self.key_released)
         root.bind("<FocusOut>", self.clear_held_keys)
+        root.bind("<Configure>", self.queue_resize_redraw)
         self.update_controls()
         self.update_strip()
         self.camera_job = root.after(0, self.refresh_camera)
@@ -243,28 +290,101 @@ class Studio:
     def tell(self, message):
         self.status.configure(text=message)
 
+    def build_action_buttons(self):
+        self.action_rows = tuple(ButtonRow(self.tk, self.root, self.background) for _ in range(3))
+        for row in self.action_rows:
+            row.frame.pack(fill="x", padx=18, pady=(4, 2))
+        self.buttons = {}
+        for row, actions in zip(self.action_rows, (
+            (
+                ("capture", "Take Photo", "Space", "space", "primary"),
+                ("overlay", "Show Last Photo", "O", "o", "normal"),
+                ("review", "Review Photos", "←", "left", "normal"),
+                ("play", "Play Movie", "P", "p", "normal"),
+                ("camera", "Back to Camera", "Esc", "escape", "primary"),
+                ("previous", "Previous", "←", "left", "normal"),
+                ("next", "Next", "→", "right", "normal"),
+                ("play_here", "Play From Here", "Space", "space", "normal"),
+                ("save", "Save Movie", "E", "e", "normal"),
+                ("keep_photo", "Keep Photo", "Esc", "escape", "primary"),
+                ("confirm_remove", "Remove Photo", "Enter", "return", "remove"),
+                ("save_retake", "Use New Photo", "Space", "space", "primary"),
+                ("cancel_retake", "Keep Last Photo", "Esc", "escape", "normal"),
+            ), (
+                ("replay", "Replay Last 6", "L", "l", "normal"),
+                ("speed", "Speed · Slow", "S", "s", "normal"),
+                ("retake", "Retake Last", "R", "r", "normal"),
+                ("fade", "Fade to Next Photo", "F", "f", "normal"),
+                ("remove", "Remove Photo", "Delete", "delete", "normal"),
+                ("tools", "Movie Tools", "M", "m", "normal"),
+                ("display", "Full Screen", "F11", "f11", "normal"),
+                ("quit", "Quit", "Q", "q", "normal"),
+            ), (
+                ("join_movies", "Join Movies", "J", "j", "normal"),
+                ("join_folders", "Join Photo Folders", "I", "i", "normal"),
+                ("voice", "Add My Voice", "N", "n", "normal"),
+            ),
+        )):
+            for name, label, hint, key, tone in actions:
+                self.buttons[name] = shortcut_button(
+                    self.tk, row.frame, label, hint, lambda key=key: self.perform_action(key),
+                    tone=tone, space_action=self.key_pressed, large=name == "capture",
+                )
+
+    def show_actions(self, first, second=(), tools=()):
+        layouts = (first, second, tools)
+        focused = self.root.focus_get()
+        visible = {self.buttons[name] for names in layouts for name in names}
+        if focused in self.buttons.values() and focused not in visible:
+            self.root.focus_set()
+        for row, names in zip(self.action_rows, layouts):
+            row.show(self.buttons[name] for name in names)
+
     def update_controls(self):
         count = len(self.frames)
-        self.count.configure(text=f"{count} photos  |  {count / self.fps:.1f} sec at {self.fps} fps")
+        fade_frames = sum(fade_frame_count(seconds, self.fps) for seconds in self.fades.values())
+        self.count.configure(text=f"{count} photos  |  {(count + fade_frames) / self.fps:.1f} sec at {self.fps} fps")
         if self.confirming_removal:
             self.heading.configure(text=f"Remove photo {self.review_index + 1}?")
-            self.primary.configure(text="Enter  Remove photo     Esc  Keep photo")
-            self.secondary.configure(text="")
+            self.show_actions(("keep_photo", "confirm_remove"))
             return
+        set_button_label(self.buttons["overlay"], "Hide Last Photo" if self.ghost else "Show Last Photo")
+        set_button_label(self.buttons["tools"], "Hide Movie Tools" if self.tools_open else "Movie Tools")
+        speed = {6: "Slow", 12: "Normal"}.get(self.fps, f"{self.fps} fps")
+        set_button_label(self.buttons["speed"], f"Speed · {speed}")
+        tools = ("join_movies", "join_folders", "voice") if self.tools_open else ()
         if self.review_index is not None:
             title = {"all": "Playing movie", "recent": "Playing last few"}.get(self.play_mode, "Review photos")
             self.heading.configure(text=f"{title}   ·   {self.review_index + 1} / {count}")
-            self.primary.configure(text="Esc  Camera     ← →  Step     Space  Pause / play     Delete  Remove photo")
+            at_end = self.review_index == count - 1
+            label = "Pause" if self.play_mode else ("Play Movie" if at_end else "Play From Here")
+            set_button_label(self.buttons["play_here"], label)
+            self.set_button_state("previous", self.review_index > 0)
+            self.set_button_state("next", not at_end)
+            self.set_button_state("fade", not at_end and self.export_job is None)
+            self.set_button_state("remove", self.export_job is None)
+            self.set_button_state("save", self.export_job is None)
+            self.show_actions(("camera", "previous", "next", "play_here", "save"),
+                              ("fade", "remove", "replay", "speed", "tools", "display", "quit"), tools)
         elif self.retake:
             self.heading.configure(text=f"Retake photo {count}")
-            self.primary.configure(text="Space  Save replacement     Esc  Cancel retake     O  Ghost overlay")
+            self.set_button_state("save_retake", self.export_job is None)
+            self.show_actions(("save_retake", "cancel_retake", "overlay"))
         else:
-            title = "Live camera · Ghost overlay on" if self.ghost and self.last_photo is not None else "Live camera"
+            title = "Live camera · Last photo showing" if self.ghost and self.last_photo is not None else "Live camera"
             self.heading.configure(text=title)
-            self.primary.configure(text="Space  Take photo     O  Ghost overlay     ← →  Compare photos")
-        self.secondary.configure(
-            text="P Play   L Loop   S Speed   R Retake   E Save MP4   J Join MP4s   I Join images   N Narrate   Q Quit"
-        )
+            for action in ("review", "play", "replay", "retake"):
+                self.set_button_state(action, count > 0)
+            self.set_button_state("capture", self.export_job is None)
+            self.set_button_state("save", count > 0 and self.export_job is None)
+            self.show_actions(("capture", "overlay", "review", "play", "save"),
+                              ("replay", "speed", "retake", "tools", "display", "quit"), tools)
+
+    def set_button_state(self, name, enabled):
+        button = self.buttons[name]
+        state = "normal" if enabled else "disabled"
+        if button.cget("state") != state:
+            button.configure(state=state)
 
     def photo_image(self, photo, width, height):
         _, ppm = cv2.imencode(".ppm", resize_to_fit(photo, width, height))
@@ -275,7 +395,7 @@ class Studio:
 
     def update_picture(self, event=None):
         if self.review_index is not None:
-            photo = self.review_photo
+            photo = self.review_photo if self.blended_photo is None else self.blended_photo
         else:
             photo = self.live_photo
             if self.ghost and photo is not None and self.last_photo is not None:
@@ -286,6 +406,31 @@ class Studio:
         if photo is not None and min(width, height) > 1:
             self.large_image = self.photo_image(photo, width, height)
             self.picture.configure(image=self.large_image, text="")
+
+    def queue_resize_redraw(self, event):
+        if event.widget not in (self.root, self.viewport):
+            return
+        if self.resize_job is not None:
+            self.root.after_cancel(self.resize_job)
+        self.resize_job = self.root.after(85, self.redraw_after_resize)
+
+    def redraw_after_resize(self):
+        self.resize_job = None
+        self.label_display_button(self.root.attributes("-fullscreen"))
+        if self.live_photo is None and self.review_index is None:
+            self.show_camera_error()
+        else:
+            self.update_picture()
+        for row in self.action_rows:
+            row.repaint()
+
+    def label_display_button(self, fullscreen):
+        set_button_label(self.buttons["display"], "Window View" if fullscreen else "Full Screen")
+        self.action_rows[1].arrange()
+
+    def set_fullscreen(self, fullscreen):
+        self.root.attributes("-fullscreen", fullscreen)
+        self.label_display_button(fullscreen)
 
     def update_strip(self):
         start = max(0, len(self.frames) - self.RECENT_COUNT)
@@ -314,7 +459,7 @@ class Studio:
 
     def refresh_camera(self):
         photo = self.feed.latest
-        if self.review_index is None:
+        if self.review_index is None and self.resize_job is None:
             if photo is None:
                 self.show_camera_error()
             elif photo is not self.live_photo:
@@ -364,6 +509,9 @@ class Studio:
             self.root.after_cancel(self.play_job)
             self.play_job = None
         self.play_mode = None
+        if self.blended_photo is not None:
+            self.blended_photo = None
+            self.update_picture()
 
     def show_photo(self, index):
         try:
@@ -389,7 +537,58 @@ class Studio:
         self.resume_mode = "all"
         index = len(self.frames) - 1 if self.review_index is None else self.review_index + direction
         if self.show_photo(max(0, min(index, len(self.frames) - 1))):
-            self.tell("Use the arrow keys to spot what changed. Esc goes back to the camera.")
+            seconds = self.fade_after(self.review_index)
+            if seconds:
+                self.tell(f"{seconds:g} sec fade to the next photo. Press F to change it.")
+            else:
+                self.tell("Use the arrow keys to compare photos. Press F to fade to the next photo.")
+
+    def fade_after(self, index):
+        if index + 1 < len(self.frames):
+            return self.fades.get(neighbor_pair(self.frames, index), 0)
+        return 0
+
+    def edit_fade(self):
+        from tkinter import simpledialog
+
+        index = self.review_index
+        if index is None or index + 1 >= len(self.frames):
+            self.tell("Use the arrow keys to pick the first of two photos, then press F.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before editing fades.")
+            return
+        self.stop_playback()
+        self.update_controls()
+        seconds = simpledialog.askfloat(
+            "Fade to Next Photo",
+            f"Fade from photo {index + 1} into photo {index + 2}.\nEnter seconds, or enter 0 to remove the fade.",
+            parent=self.root, initialvalue=self.fade_after(index) or 1.0,
+            minvalue=0, maxvalue=MAX_FADE_SECONDS,
+        )
+        if seconds is None:
+            return
+        if not 0 <= seconds <= MAX_FADE_SECONDS:
+            self.tell(f"Choose a fade between 0 and {MAX_FADE_SECONDS} seconds.")
+            return
+        pair = neighbor_pair(self.frames, index)
+        fades = self.fades.copy()
+        if seconds:
+            fades[pair] = seconds
+        else:
+            fades.pop(pair, None)
+        try:
+            save_fades(self.folder, fades)
+        except OSError as error:
+            self.tell("Could not save the fade. Check the project folder permissions.")
+            print(error, file=sys.stderr)
+            return
+        self.fades = fades
+        self.update_controls()
+        if seconds:
+            self.tell(f"{seconds:g} sec fade saved. Press Space to preview from here.")
+        else:
+            self.tell("Fade removed.")
 
     def play(self, mode, start=None):
         if not self.frames:
@@ -403,6 +602,7 @@ class Studio:
 
     def play_frame(self, index, first, due):
         self.play_job = None
+        self.blended_photo = None
         if index == len(self.frames):
             if self.play_mode == "recent":
                 index = first
@@ -415,8 +615,34 @@ class Studio:
         if self.show_photo(index):
             rate = min(self.fps, 6) if self.play_mode == "recent" else self.fps
             next_due = due + 1 / rate
-            delay = max(1, round((next_due - monotonic()) * 1000))
-            self.play_job = self.root.after(delay, self.play_frame, index + 1, first, next_due)
+            count = fade_frame_count(self.fade_after(index), rate)
+            if not count:
+                self.queue_playback(next_due, self.play_frame, index + 1, first, next_due)
+                return
+            try:
+                height, width = read_photo(self.frames[0]).shape[:2]
+                before = fit_movie_frame(self.review_photo, width, height)
+                after = fit_movie_frame(read_photo(self.frames[index + 1]), width, height)
+            except (ValueError, cv2.error) as error:
+                self.stop_playback()
+                self.update_controls()
+                self.tell(str(error).splitlines()[0])
+                return
+            self.queue_playback(next_due, self.play_fade, index, first, next_due, before, after, 1, count, rate)
+
+    def queue_playback(self, due, callback, *args):
+        delay = max(1, round((due - monotonic()) * 1000))
+        self.play_job = self.root.after(delay, callback, *args)
+
+    def play_fade(self, index, first, due, before, after, step, count, rate):
+        self.play_job = None
+        self.blended_photo = blend_frame(before, after, step, count)
+        self.update_picture()
+        next_due = due + 1 / rate
+        if step == count:
+            self.queue_playback(next_due, self.play_frame, index + 1, first, next_due)
+        else:
+            self.queue_playback(next_due, self.play_fade, index, first, next_due, before, after, step + 1, count, rate)
 
     def back_to_camera(self):
         self.stop_playback()
@@ -473,6 +699,7 @@ class Studio:
             return
 
         del self.frames[index]
+        self.fades = {pair: seconds for pair, seconds in self.fades.items() if photo.name not in pair}
         self.last_photo = new_last
         self.thumbnail.cache_clear()
         self.strip_start = None
@@ -487,6 +714,7 @@ class Studio:
         if self.export_job is None:
             self.tell(f"Saving your MP4 at {self.fps} fps...")
             self.export_job = self.exporter.submit(export_movie, self.folder, self.fps)
+            self.update_controls()
             self.root.after(100, self.check_export)
 
     def check_export(self):
@@ -502,6 +730,7 @@ class Studio:
             print(error, file=sys.stderr)
         finally:
             self.export_job = None
+            self.update_controls()
 
     def open_joiner(self, dialog):
         if self.export_job is not None:
@@ -530,6 +759,13 @@ class Studio:
                 self.held_keys[key] = None
             return "break"
         self.held_keys[key] = None
+        self.perform_action(key)
+        return "break"
+
+    def perform_action(self, key):
+        if key == "f11":
+            self.set_fullscreen(not self.root.attributes("-fullscreen"))
+            return
         if self.confirming_removal:
             if key in ("return", "kp_enter"):
                 self.remove_review_photo()
@@ -537,7 +773,7 @@ class Studio:
                 self.confirming_removal = False
                 self.update_controls()
                 self.tell("Photo kept.")
-            return "break"
+            return
         if key == "space":
             if self.review_index is None:
                 self.capture()
@@ -554,15 +790,17 @@ class Studio:
             self.update_controls()
             self.update_picture()
             if not self.ghost:
-                self.tell("Ghost overlay off.")
+                self.tell("Last photo hidden.")
             elif not self.frames:
-                self.tell("Ghost overlay turns on after your first photo.")
+                self.tell("Your last photo will appear here after you take one.")
             else:
-                self.tell("Ghost overlay on. Line up your next move.")
+                self.tell("Line up your next shot with the faint copy of the last photo.")
         elif key in ("left", "right"):
             self.step(-1 if key == "left" else 1)
         elif key in ("delete", "kp_delete"):
             self.ask_remove_photo()
+        elif key == "f":
+            self.edit_fade()
         elif key in ("p", "l"):
             self.play("all" if key == "p" else "recent")
         elif key == "s":
@@ -578,11 +816,13 @@ class Studio:
             self.open_joiner(ImageJoinDialog)
         elif key == "n":
             self.open_narration()
+        elif key == "m":
+            self.tools_open = not self.tools_open
+            self.update_controls()
         elif key == "escape":
             self.back_to_camera()
         elif key == "q":
             self.close()
-        return "break"
 
     def key_released(self, event):
         key = event.keysym.lower()
@@ -608,6 +848,8 @@ class Studio:
                 return
         self.stop_playback()
         self.root.after_cancel(self.camera_job)
+        if self.resize_job is not None:
+            self.root.after_cancel(self.resize_job)
         self.clear_held_keys()
         self.root.destroy()
 
@@ -628,7 +870,8 @@ def run_studio(root, tk, folder, camera_index, fps):
         feed = CameraFeed(camera)
         try:
             with ThreadPoolExecutor(max_workers=1) as exporter:
-                Studio(root, tk, feed, folder, frames, fps, exporter)
+                studio = Studio(root, tk, feed, folder, frames, fps, exporter)
+                studio.set_fullscreen(True)
                 root.mainloop()
         finally:
             feed.close()
@@ -640,7 +883,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", type=Path, help="Open this project folder directly")
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--fps", type=int, choices=range(1, 61), default=12, metavar="1-60")
+    parser.add_argument("--fps", type=int, choices=range(1, 61), default=6, metavar="1-60",
+                        help="Starting playback and export speed (default: 6)")
     parser.add_argument("--export-only", action="store_true", help="Export an existing project without opening the camera")
     args = parser.parse_args()
     if args.export_only:
