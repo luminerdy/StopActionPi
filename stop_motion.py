@@ -3,6 +3,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -18,12 +19,13 @@ from movie_output import publish_movie
 from photo_drawings import draw_strokes, project_drawings, save_drawings
 from photo_messages import draw_message, hold_frames, project_messages, save_messages
 from photo_sequence import MAX_COPIES, duplicate_photo, order_photos, save_photo_order
-from transitions import MAX_FADE_SECONDS, blend_frame, fade_frame_count, neighbor_pair, project_fades, save_fades
+from transitions import MAX_FADE_SECONDS, blend_frame, fade_frame_count, neighbor_pair, project_fades, read_fades, save_fades
 from ui_controls import ButtonRow, choose_movie_speed, set_button_label, shortcut_button
 
 
 REMOVED_DIR = ".removed"
 SHIFT_MASK = 0x0001
+CONTROL_MASK = 0x0004
 
 
 def frame_number(path):
@@ -212,7 +214,7 @@ class CameraFeed:
 class Studio:
     RECENT_COUNT = 6
 
-    def __init__(self, root, tk, feed, folder, frames, fps, exporter):
+    def __init__(self, root, tk, feed, folder, frames, fps, exporter, choose_project=None):
         self.root = root
         self.tk = tk
         self.feed = feed
@@ -226,6 +228,8 @@ class Studio:
         self.next_frame_number = max(map(frame_number, stored_frames), default=0) + 1
         self.fps = fps
         self.exporter = exporter
+        self.choose_project = choose_project
+        self.next_project = None
         self.live_photo = None
         self.last_photo = read_photo(frames[-1]) if frames else None
         self.review_index = None
@@ -237,15 +241,20 @@ class Studio:
         self.play_mode = None
         self.resume_mode = "all"
         self.export_job = None
+        self.cut_revision = 0
+        self.cut_export = None
+        self.last_saved_movie = None
         self.duplicate_job = None
         self.join_dialog = None
         self.narration_dialog = None
         self.ghost = False
         self.retake = False
         self.confirming_removal = False
-        self.tools_open = False
+        self.removed_photo = None
+        self.tools_panel = None
         self.held_keys = {}
         self.strip_start = None
+        self.strip_offset = None
         self.large_image = None
         self.resize_job = None
         self.thumbnail = lru_cache(maxsize=24)(self.make_thumbnail)
@@ -262,38 +271,53 @@ class Studio:
         root.geometry(f"{width}x{height}")
         root.protocol("WM_DELETE_WINDOW", self.close)
 
-        header = tk.Frame(root, bg=self.background)
-        header.pack(fill="x", padx=18, pady=(10, 4))
-        self.heading = self.label(header, "Live camera", size=21, bold=True)
+        self.surface = tk.Frame(root, bg=self.background)
+        self.surface.pack(fill="both", expand=True)
+        header = tk.Frame(self.surface, bg=self.background)
+        header.pack(fill="x", padx=18, pady=(8, 2))
+        self.header_actions = tk.Frame(header, bg=self.background)
+        self.header_actions.pack(side="right")
+        title = folder.name if len(folder.name) <= 36 else folder.name[:35] + "…"
+        self.label(header, title, size=17, bold=True).pack(side="left", fill="x", expand=True)
+        details = tk.Frame(self.surface, bg=self.background)
+        details.pack(fill="x", padx=18, pady=(0, 4))
+        self.heading = self.label(details, "Live camera", size=14, bold=True)
         self.heading.pack(side="left")
-        self.count = self.label(header, "", size=13)
+        self.count = self.label(details, "", size=12)
         self.count.pack(side="right")
 
-        self.viewport = tk.Frame(root, bg="#0a0f17")
+        self.viewport = tk.Frame(self.surface, bg="#0a0f17")
         self.viewport.pack(fill="both", expand=True, padx=18)
         self.viewport.pack_propagate(False)
         self.picture = tk.Label(self.viewport, text="Starting camera...", bg="#0a0f17", fg=self.text)
         self.picture.pack(fill="both", expand=True)
 
-        self.status = self.label(root, "Move your subject a little, then press Space.", size=13, bold=True)
+        self.status = self.label(self.surface, "Move your subject a little, then press Space.", size=13, bold=True)
         self.status.pack(fill="x", padx=18, pady=(4, 2))
-        self.strip = tk.Frame(root, bg=self.background)
-        self.strip.pack(fill="x", padx=18)
+        filmstrip = tk.Frame(self.surface, bg=self.background)
+        filmstrip.pack(fill="x", padx=18)
+        self.strip = tk.Frame(filmstrip, bg=self.background)
+        self.strip.pack(fill="x")
+        self.strip_scroll = tk.Scrollbar(filmstrip, orient="horizontal", command=self.scroll_strip)
         self.slots = []
-        for _ in range(self.RECENT_COUNT):
-            tile = tk.Frame(self.strip, bg=self.panel, padx=3, pady=3)
-            thumb = tk.Label(tile, bg=self.panel, bd=0)
+        for offset in range(self.RECENT_COUNT):
+            tile = tk.Frame(self.strip, bg=self.panel, padx=3, pady=2, cursor="hand2")
+            thumb = tk.Label(tile, bg=self.panel, bd=0, cursor="hand2")
             thumb.pack()
             number = self.label(tile, "", size=10, bg=self.panel)
             number.pack()
             self.slots.append((tile, thumb, number))
+            for target in (tile, thumb, number):
+                target.bind("<Button-1>", lambda event, offset=offset: self.pick_thumbnail(offset))
+                for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    target.bind(event, self.scroll_thumbnails)
 
         self.build_action_buttons()
 
-        root.bind("<KeyPress>", self.key_pressed)
-        root.bind("<KeyRelease>", self.key_released)
-        root.bind("<FocusOut>", self.clear_held_keys)
-        root.bind("<Configure>", self.queue_resize_redraw)
+        self.bindings = {event: root.bind(event, handler) for event, handler in (
+            ("<KeyPress>", self.key_pressed), ("<KeyRelease>", self.key_released),
+            ("<FocusOut>", self.clear_held_keys), ("<Configure>", self.queue_resize_redraw),
+        )}
         self.update_controls()
         self.update_strip()
         self.camera_job = root.after(0, self.refresh_camera)
@@ -309,28 +333,38 @@ class Studio:
         self.status.configure(text=message)
 
     def build_action_buttons(self):
-        self.action_rows = tuple(ButtonRow(self.tk, self.root, self.background) for _ in range(3))
-        for row in self.action_rows:
-            row.frame.pack(fill="x", padx=18, pady=(4, 2))
+        self.action_rows = tuple(ButtonRow(self.tk, self.surface, self.background) for _ in range(2))
         self.buttons = {}
-        for row, actions in zip(self.action_rows, (
+        for parent, actions in zip((self.header_actions, *(row.frame for row in self.action_rows)), (
+            (
+                ("my_movies", "My Movies", "Ctrl+O", "ctrl-o", "normal"),
+                ("speed", "Speed", "S", "s", "normal"),
+                ("display", "Full Screen", "F11", "f11", "normal"),
+                ("quit", "Quit", "Q", "q", "normal"),
+            ),
             (
                 ("capture", "Take Photo", "Space", "space", "primary"),
                 ("overlay", "Show Last Photo", "O", "o", "normal"),
+                ("replay", "Replay Last 6", "L", "l", "normal"),
                 ("review", "Review Photos", "←", "left", "normal"),
                 ("play", "Play Movie", "P", "p", "normal"),
                 ("camera", "Back to Camera", "Esc", "escape", "primary"),
                 ("previous", "Previous", "←", "left", "normal"),
                 ("next", "Next", "→", "right", "normal"),
                 ("play_here", "Play From Here", "Space", "space", "normal"),
-                ("save", "Save Movie", "E", "e", "normal"),
+                ("camera_tools", "Camera Tools", "C", "c", "normal"),
+                ("edit", "Edit Photo", "Enter", "return", "normal"),
+                ("finish", "Finish", "M", "m", "normal"),
+                ("close_finish", "Back", "Esc", "escape", "normal"),
+                ("save", "Save MP4", "E", "e", "primary"),
+                ("join_movies", "Join Movies", "J", "j", "normal"),
+                ("join_folders", "Join Photo Folders", "I", "i", "normal"),
+                ("voice", "Add My Voice", "N", "n", "normal"),
                 ("keep_photo", "Keep Photo", "Esc", "escape", "primary"),
                 ("confirm_remove", "Remove Photo", "Enter", "return", "remove"),
                 ("save_retake", "Use New Photo", "Space", "space", "primary"),
                 ("cancel_retake", "Keep Last Photo", "Esc", "escape", "normal"),
             ), (
-                ("replay", "Replay Last 6", "L", "l", "normal"),
-                ("speed", "Speed", "S", "s", "normal"),
                 ("retake", "Retake Last", "R", "r", "normal"),
                 ("fade", "Fade to Next Photo", "F", "f", "normal"),
                 ("duplicate", "Duplicate Photo", "D", "d", "normal"),
@@ -339,44 +373,56 @@ class Studio:
                 ("earlier", "Move Earlier", "Shift+Left", "shift-left", "normal"),
                 ("later", "Move Later", "Shift+Right", "shift-right", "normal"),
                 ("remove", "Remove Photo", "Delete", "delete", "normal"),
-                ("tools", "Movie Tools", "M", "m", "normal"),
-                ("display", "Full Screen", "F11", "f11", "normal"),
-                ("quit", "Quit", "Q", "q", "normal"),
-            ), (
-                ("join_movies", "Join Movies", "J", "j", "normal"),
-                ("join_folders", "Join Photo Folders", "I", "i", "normal"),
-                ("voice", "Add My Voice", "N", "n", "normal"),
+                ("undo_remove", "Undo Remove", "Ctrl+Z", "ctrl-z", "primary"),
+                ("watch", "Watch Saved Movie", None, "watch", "normal"),
+                ("show_folder", "Show in Folder", None, "show-folder", "normal"),
             ),
         )):
             for name, label, hint, key, tone in actions:
                 self.buttons[name] = shortcut_button(
-                    self.tk, row.frame, label, hint, lambda key=key: self.perform_action(key),
+                    self.tk, parent, label, hint, lambda key=key: self.perform_action(key),
                     tone=tone, space_action=self.key_pressed, large=name == "capture",
                 )
+                if parent is self.header_actions and (name != "my_movies" or self.choose_project is not None):
+                    self.buttons[name].pack(side="left", padx=(6, 0))
 
-    def show_actions(self, first, second=(), tools=()):
-        layouts = (first, second, tools)
+    def show_actions(self, first, second=()):
+        layouts = (first, second)
         focused = self.root.focus_get()
         visible = {self.buttons[name] for names in layouts for name in names}
-        if focused in self.buttons.values() and focused not in visible:
+        if focused in self.buttons.values() and focused.master is not self.header_actions and focused not in visible:
             self.root.focus_set()
         for row, names in zip(self.action_rows, layouts):
+            if names and not row.frame.winfo_manager():
+                row.frame.pack(fill="x", padx=18, pady=(3, 2))
+            elif not names:
+                row.frame.pack_forget()
             row.show(self.buttons[name] for name in names)
 
     def update_controls(self):
         count = len(self.frames)
         fade_frames = sum(fade_frame_count(seconds, self.fps) for seconds in self.fades.values())
         still_frames = sum(hold_frames(self.messages.get(photo.name), self.fps) for photo in self.frames)
-        self.count.configure(text=f"{count} photos  |  {(still_frames + fade_frames) / self.fps:.1f} sec at {self.fps} fps")
+        self.count.configure(text=f"{count} photos  ·  {(still_frames + fade_frames) / self.fps:.1f} sec")
+        set_button_label(self.buttons["speed"], f"Speed · {self.fps} fps")
         if self.confirming_removal:
             self.heading.configure(text=f"Remove photo {self.review_index + 1}?")
             self.show_actions(("keep_photo", "confirm_remove"))
             return
         set_button_label(self.buttons["overlay"], "Hide Last Photo" if self.ghost else "Show Last Photo")
-        set_button_label(self.buttons["tools"], "Hide Movie Tools" if self.tools_open else "Movie Tools")
-        set_button_label(self.buttons["speed"], f"Speed · {self.fps} fps")
-        tools = ("join_movies", "join_folders", "voice") if self.tools_open else ()
-        if self.review_index is not None:
+        set_button_label(self.buttons["camera_tools"], "Hide Camera Tools" if self.tools_panel == "camera" else "Camera Tools")
+        set_button_label(self.buttons["edit"], "Hide Edit Tools" if self.tools_panel == "edit" else "Edit Photo")
+        can_edit = self.export_job is None and self.duplicate_job is None
+        undo = ("undo_remove",) if self.removed_photo is not None else ()
+        self.set_button_state("undo_remove", can_edit)
+        if self.tools_panel == "finish":
+            self.heading.configure(text="Finish your movie")
+            self.set_button_state("save", count > 0 and can_edit)
+            for action in ("join_movies", "join_folders", "voice"):
+                self.set_button_state(action, can_edit)
+            saved = ("watch", "show_folder") if self.last_saved_movie is not None else ()
+            self.show_actions(("close_finish", "save", "voice", "join_movies", "join_folders"), saved)
+        elif self.review_index is not None:
             title = {"all": "Playing movie", "recent": "Playing last few"}.get(self.play_mode, "Review photos")
             self.heading.configure(text=f"{title}   ·   {self.review_index + 1} / {count}")
             at_end = self.review_index == count - 1
@@ -384,19 +430,17 @@ class Studio:
             set_button_label(self.buttons["play_here"], label)
             self.set_button_state("previous", self.review_index > 0)
             self.set_button_state("next", not at_end)
-            can_edit = self.export_job is None and self.duplicate_job is None
             self.set_button_state("fade", not at_end and can_edit)
             self.set_button_state("earlier", self.review_index > 0 and can_edit)
             self.set_button_state("later", not at_end and can_edit)
             has_message = self.frames[self.review_index].name in self.messages
             set_button_label(self.buttons["message"], "Edit Message" if has_message else "Add Message")
-            for action in ("duplicate", "message", "draw", "remove", "save"):
+            for action in ("duplicate", "message", "draw", "remove"):
                 self.set_button_state(action, can_edit)
+            edits = ("earlier", "later", "duplicate", "message", "draw", "fade", "remove") if self.tools_panel == "edit" else ()
             self.show_actions(
-                ("camera", "previous", "next", "play_here", "save"),
-                ("earlier", "later", "duplicate", "message", "draw", "fade", "remove",
-                 "replay", "speed", "tools", "display", "quit"),
-                tools,
+                ("camera", "previous", "next", "play_here", "edit", "finish"),
+                (*undo, *edits),
             )
         elif self.retake:
             self.heading.configure(text=f"Retake photo {count}")
@@ -408,9 +452,9 @@ class Studio:
             for action in ("review", "play", "replay", "retake"):
                 self.set_button_state(action, count > 0)
             self.set_button_state("capture", self.export_job is None)
-            self.set_button_state("save", count > 0 and self.export_job is None)
-            self.show_actions(("capture", "overlay", "review", "play", "save"),
-                              ("replay", "speed", "retake", "tools", "display", "quit"), tools)
+            camera_tools = ("retake",) if self.tools_panel == "camera" else ()
+            self.show_actions(("capture", "overlay", "replay", "review", "play", "camera_tools", "finish"),
+                              (*undo, *camera_tools))
 
     def set_button_state(self, name, enabled):
         button = self.buttons[name]
@@ -455,10 +499,11 @@ class Studio:
             self.update_picture()
         for row in self.action_rows:
             row.repaint()
+        for button in self.header_actions.winfo_children():
+            button.configure(background=button.cget("background"))
 
     def label_display_button(self, fullscreen):
         set_button_label(self.buttons["display"], "Window View" if fullscreen else "Full Screen")
-        self.action_rows[1].arrange()
 
     def set_fullscreen(self, fullscreen):
         self.root.attributes("-fullscreen", fullscreen)
@@ -478,19 +523,27 @@ class Studio:
             self.tell(f"Movie speed set to {speed} fps.")
 
     def update_strip(self):
-        start = max(0, len(self.frames) - self.RECENT_COUNT)
+        count = len(self.frames)
+        last_page = max(0, count - self.RECENT_COUNT)
+        start = last_page if self.strip_offset is None else min(self.strip_offset, last_page)
         if self.review_index is not None:
-            start = min(start, self.review_index)
+            start = max(self.review_index - self.RECENT_COUNT + 1, min(start, self.review_index))
+            self.strip_offset = start
+        if last_page:
+            if not self.strip_scroll.winfo_manager():
+                self.strip_scroll.pack(fill="x")
+            self.strip_scroll.set(start / count, min(start + self.RECENT_COUNT, count) / count)
+        else:
+            self.strip_scroll.pack_forget()
         if self.strip_start != start:
             for offset, (tile, thumb, number) in enumerate(self.slots):
                 index = start + offset
-                if index < len(self.frames):
+                if index < count:
                     try:
                         thumb.image = self.thumbnail(self.frames[index])
                     except ValueError:
                         thumb.image = None
                     thumb.configure(image=thumb.image or "", text="?" if thumb.image is None else "")
-                    number.configure(text=str(index + 1))
                     tile.pack(side="left", padx=(0, 6))
                 else:
                     tile.pack_forget()
@@ -498,9 +551,47 @@ class Studio:
                     thumb.image = None
             self.strip_start = start
         for offset, (tile, _, number) in enumerate(self.slots):
-            selected = start + offset == self.review_index
+            index = start + offset
+            if index >= count:
+                break
+            name = self.frames[index].name
+            markers = [letter for letter, enabled in (
+                ("T", name in self.messages), ("B", name in self.drawings), ("F", self.fade_after(index)),
+            ) if enabled]
+            caption = str(index + 1) + ("  ·  " + " ".join(markers) if markers else "")
+            if caption != number.cget("text"):
+                number.configure(text=caption)
+            selected = index == self.review_index
             tile.configure(bg=self.accent if selected else self.panel)
             number.configure(fg=self.accent if selected else self.muted)
+
+    def scroll_strip(self, action, amount, unit=None):
+        if self.confirming_removal or self.duplicate_job is not None or self.retake:
+            return
+        if action == "moveto":
+            start = round(len(self.frames) * float(amount))
+        else:
+            step = self.RECENT_COUNT if unit == "pages" else 1
+            start = (self.strip_start or 0) + int(amount) * step
+        self.strip_offset = max(0, min(start, len(self.frames) - self.RECENT_COUNT))
+        if self.review_index is not None and self.tools_panel != "finish":
+            target = max(self.strip_offset, min(self.review_index, self.strip_offset + self.RECENT_COUNT - 1))
+            if target != self.review_index:
+                self.select_photo(target)
+                return
+        self.update_strip()
+
+    def scroll_thumbnails(self, event):
+        direction = -1 if event.num == 4 or event.delta > 0 else 1
+        self.scroll_strip("scroll", direction)
+        return "break"
+
+    def pick_thumbnail(self, offset):
+        index = (self.strip_start or 0) + offset
+        if not self.confirming_removal and self.duplicate_job is None and not self.retake and index < len(self.frames):
+            self.root.focus_set()
+            self.select_photo(index)
+        return "break"
 
     def refresh_camera(self):
         photo = self.feed.latest
@@ -542,9 +633,12 @@ class Studio:
         else:
             self.frames.append(path)
             self.next_frame_number += 1
+            self.removed_photo = None
+        self.cut_revision += 1
         self.last_photo = self.live_photo
         self.retake = False
         self.strip_start = None
+        self.strip_offset = None
         self.update_strip()
         self.update_controls()
         self.tell(f"Photo {len(self.frames)} saved. Move a little, then press Space.")
@@ -583,10 +677,15 @@ class Studio:
         if not self.frames:
             self.tell("Take a photo first, then use the arrow keys to look back.")
             return
+        index = len(self.frames) - 1 if self.review_index is None else self.review_index + direction
+        self.select_photo(max(0, min(index, len(self.frames) - 1)))
+
+    def select_photo(self, index):
         self.stop_playback()
         self.resume_mode = "all"
-        index = len(self.frames) - 1 if self.review_index is None else self.review_index + direction
-        if self.show_photo(max(0, min(index, len(self.frames) - 1))):
+        if self.tools_panel != "edit":
+            self.tools_panel = None
+        if self.show_photo(index):
             seconds = self.fade_after(self.review_index)
             if seconds:
                 self.tell(f"{seconds:g} sec fade to the next photo. Press F to change it.")
@@ -622,6 +721,8 @@ class Studio:
 
         skipped_fade = self.fades.keys() - fades.keys()
         self.frames = frames
+        self.removed_photo = None
+        self.cut_revision += 1
         self.last_photo = last_photo
         self.fades = fades
         self.strip_start = None
@@ -672,6 +773,8 @@ class Studio:
             print(error, file=sys.stderr)
             return
         self.frames[index + 1:index + 1] = copies
+        self.removed_photo = None
+        self.cut_revision += 1
         self.next_frame_number += len(copies)
         self.strip_start = None
         self.show_photo(index)
@@ -709,6 +812,7 @@ class Studio:
             print(error, file=sys.stderr)
             return
         self.messages = messages
+        self.cut_revision += 1
         if self.show_photo(index):
             if message is None:
                 self.tell("Message removed.")
@@ -746,6 +850,7 @@ class Studio:
             print(error, file=sys.stderr)
             return
         self.drawings = drawings
+        self.cut_revision += 1
         if self.show_photo(index):
             self.tell("Drawing saved." if strokes else "Drawing removed.")
 
@@ -778,19 +883,24 @@ class Studio:
             self.tell(f"Choose a fade between 0 and {MAX_FADE_SECONDS} seconds.")
             return
         pair = neighbor_pair(self.frames, index)
-        fades = self.fades.copy()
-        if seconds:
-            fades[pair] = seconds
-        else:
-            fades.pop(pair, None)
         try:
+            fades = read_fades(self.folder)
+            if seconds:
+                fades[pair] = seconds
+            else:
+                fades.pop(pair, None)
             save_fades(self.folder, fades)
-        except OSError as error:
+        except (OSError, ValueError) as error:
             self.tell("Could not save the fade. Check the project folder permissions.")
             print(error, file=sys.stderr)
             return
-        self.fades = fades
+        if seconds:
+            self.fades[pair] = seconds
+        else:
+            self.fades.pop(pair, None)
+        self.cut_revision += 1
         self.update_controls()
+        self.update_strip()
         if seconds:
             self.tell(f"{seconds:g} sec fade saved. Press Space to preview from here.")
         else:
@@ -801,6 +911,8 @@ class Studio:
             self.tell("Take a photo first, then play your movie.")
             return
         self.stop_playback()
+        if self.tools_panel != "edit":
+            self.tools_panel = None
         self.play_mode = mode
         first = max(0, len(self.frames) - self.RECENT_COUNT) if mode == "recent" else 0
         self.tell("Space pauses playback. Esc goes back to the camera.")
@@ -858,6 +970,8 @@ class Studio:
         self.drawn_photo = None
         self.review_display = None
         self.retake = False
+        self.tools_panel = None
+        self.strip_offset = None
         self.update_controls()
         self.update_strip()
         if self.live_photo is None:
@@ -894,9 +1008,11 @@ class Studio:
         destination = self.folder / REMOVED_DIR / photo.name
         self.confirming_removal = False
         new_last = self.last_photo
+        remaining = self.frames[:index] + self.frames[index + 1:]
         try:
             if index == len(self.frames) - 1:
                 new_last = read_photo(self.frames[index - 1]) if index else None
+            fades = project_fades(self.folder, remaining)
             destination.parent.mkdir(exist_ok=True)
             if destination.exists():
                 raise FileExistsError(f"A removed copy of {photo.name} already exists.")
@@ -907,56 +1023,142 @@ class Studio:
             print(error, file=sys.stderr)
             return
 
-        del self.frames[index]
-        self.fades = {pair: seconds for pair, seconds in self.fades.items() if photo.name not in pair}
+        self.frames = remaining
+        self.removed_photo = (photo, index)
+        self.cut_revision += 1
+        self.fades = fades
         self.last_photo = new_last
         self.thumbnail.cache_clear()
         self.strip_start = None
         if not self.frames or not self.show_photo(min(index, len(self.frames) - 1)):
             self.back_to_camera()
-        self.tell(f"Photo {index + 1} removed from the movie.")
+        self.tell(f"Photo {index + 1} removed. Press Ctrl+Z to bring it back.")
 
-    def export(self):
+    def undo_remove(self):
+        if self.removed_photo is None or self.export_job is not None:
+            return
+        self.stop_playback()
+        self.resume_mode = "all"
+        photo, index = self.removed_photo
+        archived = self.folder / REMOVED_DIR / photo.name
+        frames = self.frames[:index] + [photo] + self.frames[index:]
+        try:
+            if photo.exists() or photo.is_symlink():
+                raise FileExistsError(photo)
+            new_last = read_photo(archived) if index == len(self.frames) else self.last_photo
+            fades = project_fades(self.folder, frames)
+            archived.rename(photo)
+        except (ValueError, OSError) as error:
+            self.update_controls()
+            self.tell("Could not bring back the photo. Check the project folder.")
+            print(error, file=sys.stderr)
+            return
+        # Removal leaves the saved order and all photo-linked edits in place.
+        self.frames, self.fades, self.last_photo = frames, fades, new_last
+        self.removed_photo = None
+        self.cut_revision += 1
+        self.strip_start = None
+        self.select_photo(index)
+        self.tell(f"Photo {index + 1} is back in the movie.")
+
+    def open_finish(self):
+        if self.tools_panel != "finish":
+            self.stop_playback()
+            self.retake = False
+            self.tools_panel = "finish"
+            self.update_controls()
+            if self.export_job is not None:
+                self.tell("Saving your MP4...")
+            elif self.last_saved_movie is not None:
+                self.tell(f"Saved movie · {self.last_saved_movie.name}")
+            else:
+                self.tell("Save your MP4, add your voice, or join scenes.")
+
+    def leave_finish(self):
+        self.tools_panel = None
+        self.update_controls()
+        self.tell("Pick a photo to review." if self.review_index is not None else "Move your subject a little, then press Space.")
+
+    def export(self, *, narrate=False):
+        self.open_finish()
         if not self.frames:
             self.tell("Take at least one photo before saving a movie.")
             return
         if self.export_job is None:
+            signature = (self.cut_revision, self.fps)
             self.tell(f"Saving your MP4 at {self.fps} fps...")
             self.export_job = self.exporter.submit(export_movie, self.folder, self.fps)
             self.update_controls()
-            self.root.after(100, self.check_export)
+            self.root.after(100, self.check_export, signature, narrate)
 
-    def check_export(self):
+    def check_export(self, signature, narrate):
         if not self.export_job.done():
-            self.root.after(100, self.check_export)
+            self.root.after(100, self.check_export, signature, narrate)
             return
+        output = None
         try:
             output = self.export_job.result()
-            self.tell(f"Movie saved! {output.name}")
-            print(f"Movie: {output}")
+            self.cut_export = (*signature, output)
+            self.report_saved_movie(output)
         except (ValueError, OSError, cv2.error) as error:
             self.tell(str(error).splitlines()[0])
             print(error, file=sys.stderr)
         finally:
             self.export_job = None
             self.update_controls()
+        if narrate and output is not None:
+            self.open_recording_studio(output)
+
+    def report_saved_movie(self, output):
+        self.last_saved_movie = output
+        self.tell(f"Movie saved! {output.name}")
+        self.update_controls()
+        print(f"Movie: {output}")
+
+    def show_saved_movie(self, watch):
+        path = self.last_saved_movie
+        if path is None or not path.is_file():
+            self.tell("That movie moved. Save a new MP4 to open it here.")
+            return
+        try:
+            if watch:
+                subprocess.Popen(["ffplay", "-autoexit", "-loglevel", "error", str(path)], stdin=subprocess.DEVNULL)
+            elif sys.platform == "win32":
+                os.startfile(path.parent)
+            else:
+                command = ["open"] if sys.platform == "darwin" else ["gio", "open"]
+                subprocess.Popen([*command, str(path.parent)], stdin=subprocess.DEVNULL)
+        except OSError as error:
+            self.tell("Could not open the saved movie." if watch else "Could not open the project folder.")
+            print(error, file=sys.stderr)
 
     def open_joiner(self, dialog):
         if self.export_job is not None:
             self.tell("Wait for the MP4 to finish saving before joining clips.")
             return
-        self.join_dialog = dialog(self.root, self.tk, self.folder, self.exporter, self.tell)
+        self.open_finish()
+        self.join_dialog = dialog(
+            self.root, self.tk, self.folder, self.exporter, self.tell, on_movie_saved=self.report_saved_movie,
+        )
 
     def open_narration(self):
         if self.export_job is not None:
             self.tell("Wait for the MP4 to finish saving before recording narration.")
             return
+        self.open_finish()
+        if not self.frames:
+            self.open_recording_studio()
+        elif self.cut_export and self.cut_export[:2] == (self.cut_revision, self.fps) and self.cut_export[2].is_file():
+            self.open_recording_studio(self.cut_export[2])
+        else:
+            self.export(narrate=True)
+
+    def open_recording_studio(self, movie=None):
         from narration_studio import NarrationDialog
 
-        self.stop_playback()
-        self.update_controls()
         self.narration_dialog = NarrationDialog(
             self.root, self.tk, self.folder, self.exporter, self.photo_image, self.tell,
+            movie=movie, on_movie_saved=self.report_saved_movie,
         )
 
     def key_pressed(self, event):
@@ -968,7 +1170,11 @@ class Studio:
                 self.held_keys[key] = None
             return "break"
         self.held_keys[key] = None
-        action = f"shift-{key}" if key in ("left", "right") and event.state & SHIFT_MASK else key
+        action = key
+        if event.state & CONTROL_MASK and key in ("o", "z"):
+            action = f"ctrl-{key}"
+        elif event.state & SHIFT_MASK and key in ("left", "right"):
+            action = f"shift-{key}"
         self.perform_action(action)
         return "break"
 
@@ -986,6 +1192,12 @@ class Studio:
                 self.update_controls()
                 self.tell("Photo kept.")
             return
+        if self.tools_panel == "finish":
+            if key in ("escape", "m"):
+                self.leave_finish()
+                return
+            if key not in ("e", "j", "i", "n", "p", "l", "s", "q", "ctrl-o", "watch", "show-folder"):
+                return
         if key == "space":
             if self.review_index is None:
                 self.capture()
@@ -1009,10 +1221,14 @@ class Studio:
                 self.tell("Line up your next shot with the faint copy of the last photo.")
         elif key in ("left", "right"):
             self.step(-1 if key == "left" else 1)
+        elif key in ("home", "end") and self.review_index is not None:
+            self.select_photo(0 if key == "home" else len(self.frames) - 1)
         elif key in ("shift-left", "shift-right"):
             self.move_review_photo(-1 if key == "shift-left" else 1)
         elif key in ("delete", "kp_delete"):
             self.ask_remove_photo()
+        elif key == "ctrl-z":
+            self.undo_remove()
         elif key == "d":
             self.duplicate_review_photo()
         elif key == "t":
@@ -1036,10 +1252,23 @@ class Studio:
         elif key == "n":
             self.open_narration()
         elif key == "m":
-            self.tools_open = not self.tools_open
+            self.open_finish()
+        elif key in ("return", "kp_enter") and self.review_index is not None:
+            self.tools_panel = None if self.tools_panel == "edit" else "edit"
             self.update_controls()
+        elif key == "c" and self.review_index is None and not self.retake:
+            self.tools_panel = None if self.tools_panel == "camera" else "camera"
+            self.update_controls()
+        elif key in ("watch", "show-folder"):
+            self.show_saved_movie(watch=key == "watch")
+        elif key == "ctrl-o":
+            self.switch_movie()
         elif key == "escape":
-            self.back_to_camera()
+            if self.tools_panel is not None:
+                self.tools_panel = None
+                self.update_controls()
+            else:
+                self.back_to_camera()
         elif key == "q":
             self.close()
 
@@ -1055,28 +1284,48 @@ class Studio:
                 self.root.after_cancel(job)
         self.held_keys.clear()
 
-    def close(self):
-        if self.duplicate_job is not None:
-            self.tell("Your photo copies are still saving. Wait a moment before quitting.")
-            return
-        if self.export_job is not None:
-            self.tell("Your MP4 is still saving. Wait a moment before quitting.")
-            return
-        if self.join_dialog is not None and self.join_dialog.job is not None:
+    def can_leave(self):
+        if self.duplicate_job is not None or self.export_job is not None:
+            self.tell("Still saving. Wait a moment before leaving this movie.")
+            return False
+        if self.join_dialog is not None and self.join_dialog.window.winfo_exists():
+            if self.join_dialog.job is not None:
+                self.join_dialog.tell("Still saving. Wait a moment before leaving this movie.")
+                return False
             self.join_dialog.close()
-            return
         if self.narration_dialog is not None and self.narration_dialog.window.winfo_exists():
             if not self.narration_dialog.close():
-                return
+                return False
+        return True
+
+    def switch_movie(self):
+        if self.choose_project is None or not self.can_leave():
+            return
+        self.stop_playback()
+        self.update_controls()
+        folder = self.choose_project()
+        if folder is not None and folder.resolve() != self.folder:
+            self.next_project = folder.resolve()
+            self.end_session()
+
+    def close(self):
+        if self.can_leave():
+            self.end_session()
+
+    def end_session(self):
         self.stop_playback()
         self.root.after_cancel(self.camera_job)
         if self.resize_job is not None:
             self.root.after_cancel(self.resize_job)
         self.clear_held_keys()
-        self.root.destroy()
+        for event, binding in self.bindings.items():
+            self.root.unbind(event, binding)
+        self.thumbnail.cache_clear()
+        self.surface.destroy()
+        self.root.quit()
 
 
-def run_studio(root, tk, folder, camera_index, fps):
+def run_studio(root, tk, folder, camera_index, fps, choose_project=None):
     folder.mkdir(parents=True, exist_ok=True)
     frames = project_frames(folder)
     camera = cv2.VideoCapture(camera_index, cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY)
@@ -1092,9 +1341,10 @@ def run_studio(root, tk, folder, camera_index, fps):
         feed = CameraFeed(camera)
         try:
             with ThreadPoolExecutor(max_workers=1) as exporter:
-                studio = Studio(root, tk, feed, folder, frames, fps, exporter)
+                studio = Studio(root, tk, feed, folder, frames, fps, exporter, choose_project)
                 studio.set_fullscreen(True)
                 root.mainloop()
+                return studio.next_project
         finally:
             feed.close()
     finally:
@@ -1118,7 +1368,7 @@ def main():
     try:
         import tkinter as tk
         from tkinter import messagebox
-        from project_picker import ProjectPicker
+        from project_picker import choose_movie
     except ImportError as error:
         raise ValueError("The desktop interface needs Tk. Install it with: sudo apt install python3-tk") from error
     try:
@@ -1126,18 +1376,22 @@ def main():
     except tk.TclError as error:
         raise ValueError(f"Could not open the studio window. Run from the Pi desktop: {error}") from error
     try:
+        projects = Path(__file__).resolve().parent / "projects"
         folder = args.project
+        direct = folder is not None
         if folder is None:
-            projects = Path(__file__).resolve().parent / "projects"
-            projects.mkdir(exist_ok=True)
-            folder = ProjectPicker(root, projects).choose()
-            if folder is None:
-                return
-        run_studio(root, tk, folder.resolve(), args.camera, args.fps)
-    except (ValueError, OSError, cv2.error) as error:
-        if args.project is None:
-            messagebox.showerror("StopActionPi", str(error), parent=root)
-        raise
+            folder = choose_movie(root, projects)
+        while folder is not None:
+            try:
+                folder = run_studio(root, tk, folder.resolve(), args.camera, args.fps,
+                                    lambda: choose_movie(root, projects, from_studio=True))
+            except (ValueError, OSError, cv2.error) as error:
+                if direct:
+                    raise
+                root.attributes("-fullscreen", False)
+                messagebox.showerror("StopActionPi", str(error), parent=root)
+                folder = choose_movie(root, projects)
+            direct = False
     finally:
         # Studio normally destroys the window when the user quits.
         try:

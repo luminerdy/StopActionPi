@@ -80,11 +80,12 @@ def join_image_folders(folders, folder):
 
 
 class JoinDialog:
-    def __init__(self, parent, tk, folder, exporter, notify):
+    def __init__(self, parent, tk, folder, exporter, notify, *, on_movie_saved=None):
         self.parent = parent
         self.folder = folder
         self.exporter = exporter
         self.notify = notify
+        self.on_movie_saved = on_movie_saved
         self.items = []
         self.job = None
         self.last_folder = folder
@@ -209,8 +210,11 @@ class JoinDialog:
         try:
             output = self.job.result()
             self.tell(f"{self.saved_label} saved! {output.name}")
-            self.notify(f"{self.saved_label} saved! {output.name}")
-            print(f"{self.saved_label}: {output}")
+            if self.on_movie_saved is not None and output.suffix.lower() == ".mp4" and output.is_file():
+                self.on_movie_saved(output)
+            else:
+                self.notify(f"{self.saved_label} saved! {output.name}")
+                print(f"{self.saved_label}: {output}")
         except (ValueError, OSError) as error:
             self.tell(str(error).splitlines()[0])
             print(error)

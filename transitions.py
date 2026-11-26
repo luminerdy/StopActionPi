@@ -16,7 +16,7 @@ def neighbor_pair(photos, index):
     return photos[index].name, photos[index + 1].name
 
 
-def project_fades(folder, photos):
+def read_fades(folder):
     path = folder / FADE_SETTINGS
     try:
         settings = json.loads(path.read_text(encoding="utf-8"))
@@ -37,6 +37,11 @@ def project_fades(folder, photos):
             fades[(before, after)] = seconds
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("This project has invalid fade settings.") from error
+    return fades
+
+
+def project_fades(folder, photos):
+    fades = read_fades(folder)
     return {pair: fades[pair] for index in range(len(photos) - 1)
             if (pair := neighbor_pair(photos, index)) in fades}
 

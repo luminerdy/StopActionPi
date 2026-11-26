@@ -36,29 +36,38 @@ Running the installer again refreshes the desktop shortcut, menu entry, and auto
 
 ## Make a movie
 
-Fix the camera in place and light the scene. Click **Take Photo** or press **Space** for the first photo. Move your subject a little and take another one. Once you have three photos, choose **Play Movie** or press **P** to watch them move, then choose **Save Movie** or press **E** to save an MP4. The buttons change as you move between the camera, photo review, and retake screens. Each shows the key that does the same thing.
+Fix the camera in place and light the scene. From **Camera**, click **Take Photo** or press **Space**. Move your subject a little and take another one. Choose **Play Movie [P]** to see your photos move.
+
+In **Review Photos**, click a thumbnail or use the arrows to pick a photo. Open **Edit Photo [Enter]** for reordering, duplication, removal, messages, drawings, and fades. Press **Home** or **End** to jump to the first or last photo. The thumbnail markers **T**, **B**, and **F** show where you've added a message, a drawing, or an outgoing fade.
+
+Open **Finish [M]** to save, narrate, or join movies and photo folders. **Save MP4 [E]** also opens Finish and starts saving. After a successful save, use **Watch Saved Movie** or **Show in Folder**.
 
 | Key | What it does |
 | --- | --- |
 | **Space** | Take and save a photo in the live view. Pause or play in review. |
 | **O** | Show or hide a faint copy of the last photo so you can see what moved. |
 | **← / →** | Open the latest saved photo, then step through the photos one by one. |
+| **Home / End** | Jump to the first or last photo in review. |
 | **Shift+← / Shift+→** | Move the selected photo one spot earlier or later in the movie. |
 | **D** | Make extra copies of the selected photo and place them right after it. |
 | **T** | Add, edit, or remove a message on the selected photo. |
 | **B** | Draw on the selected photo or clear its drawing. |
 | **Delete** | Remove the photo shown in review. Press **Enter** to remove it or **Esc** to keep it. |
+| **Ctrl+Z** | Bring back the most recently removed photo before making another change to the photo sequence. |
+| **Enter** | Show or hide Edit Photo tools during review. |
 | **F** | Add or edit a fade from the selected photo into the next one. |
 | **P** | Play the movie from the first photo through the newest one. |
 | **L** | Replay the last six photos slowly to check the motion. |
 | **S** | Choose any speed from 2 to 32 fps for full playback and the next MP4 export. Use the arrow keys or slider, then press **Enter**. |
-| **Esc** | Return to the live camera or cancel a retake. |
+| **Esc** | Back out of the open panel, return to the camera, or cancel a retake. |
+| **C** | Open Camera Tools in the live view. |
 | **R** | Set up a retake. **Space** replaces the last photo and **Esc** keeps it. |
-| **E** | Save Movie creates an MP4 in the project folder. Wait for “Movie saved!” on screen. |
-| **M** | Show or hide Movie Tools for joining movies, joining photo folders, or adding your voice. |
+| **E** | Save an MP4 in the project folder. |
+| **M** | Open or close Finish. |
 | **J** | Join two or more saved MP4s into one movie. |
 | **I** | Copy photos from one or more folders into a new numbered sequence. |
-| **N** | Record narration for a finished MP4 using a connected microphone. |
+| **N** | Open Recording Studio with the current cut, using a connected microphone to record. |
+| **Ctrl+O** | Open My Movies to switch projects. |
 | **F11** | Switch between full screen and window view. |
 | **Q** | Quit. Your photos are already saved. |
 
@@ -112,7 +121,7 @@ To review the joined sequence or turn it into an MP4, reopen StopActionPi and ch
 
 ## Recording Studio
 
-Finish and export your movie. If you're making it from several MP4s, join them before recording. Open **Movie Tools** and choose **Add My Voice**, or press **N**. Choose your movie with **A**. You can start with a silent movie or reopen one with narration already on it.
+Open **Finish** and choose **Add My Voice**, or press **N**. Recording Studio opens the current cut and saves a fresh MP4 when the photos, edits, or speed have changed. To narrate a joined movie or continue editing an earlier narrated movie, use **Choose Existing MP4 [A]**.
 
 1. Use the arrow keys or click the timeline to find the start. Press **1** to mark it. Find the end and press **2**. Leave the marks as they are to record the whole movie. Type an optional cue line in the text box.
 2. Press **T** to rehearse with up to three seconds of lead-in. Press **R** to record the section after a countdown. Speak when you see “Recording.” The take stops at the end of the section, or press **S** to stop early.
@@ -123,7 +132,7 @@ The app prefers the Logitech C270 microphone when it finds one in the Pi desktop
 
 ## Resume or change playback speed
 
-Quit with **Q** and open StopActionPi again. Choose the same movie on the welcome screen to reload your photos. The app starts at 6 fps, and **Speed [S]** lets you pick 2 to 32 fps during a session. **Replay Last 6 [L]** plays at up to 6 fps for a closer look. For terminal use from the Pi desktop, `--project` skips the welcome screen and `--fps` picks the starting speed. Open each project in one window at a time.
+Choose **My Movies [Ctrl+O]** to switch projects, or reopen StopActionPi later and choose the same movie to reload your photos. A project opens at 6 fps, and **Speed [S]** lets you pick 2 to 32 fps during a session. **Replay Last 6 [L]** plays at up to 6 fps for a closer look. For terminal use from the Pi desktop, `--project` skips the welcome screen and `--fps` picks the starting speed. Open each project in one window at a time.
 
 ```bash
 python3 stop_motion.py --project projects/first_movie --fps 8
@@ -148,6 +157,6 @@ For flicker, use steady lighting and avoid changing daylight. Inspect available 
 
 See the [project specification and first run checks](SPEC.md) for behavior, file formats, and a guide to the source. See [LICENSE](LICENSE) for reuse terms.
 
-The [Camera, Review, and Finish implementation plan](SPEC.md#camera-review-and-finish-implementation-plan) describes the proposed layout and how to test it.
+The [Camera, Review, and Finish layout](SPEC.md#camera-review-and-finish) describes the current workflow and how to test it.
 
 See also [Logitech C270 specifications](https://support.logi.com/hc/en-001/articles/360023393913-Logitech-HD-Webcam-C270-Technical-Specifications) and [Raspberry Pi USB webcam documentation](https://www.raspberrypi.com/documentation/accessories/camera-software.html).

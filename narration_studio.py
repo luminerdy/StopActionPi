@@ -17,9 +17,10 @@ from ui_controls import ButtonRow, set_button_label, shortcut_button
 class NarrationDialog:
     LEAD_IN = 3
 
-    def __init__(self, root, tk, folder, executor, render, notify):
+    def __init__(self, root, tk, folder, executor, render, notify, *, movie=None, on_movie_saved=None):
         self.parent = root
         self.folder, self.executor, self.render, self.notify = folder, executor, render, notify
+        self.on_movie_saved = on_movie_saved
         self.temp = TemporaryDirectory(prefix="stopactionpi-narration-")
         directory = Path(self.temp.name)
         self.working = directory / "accepted.wav"
@@ -61,7 +62,7 @@ class NarrationDialog:
         self.buttons = {}
         self.action_rows = []
         for actions in (
-            (("a", "Choose Movie", "A", self.choose), ("1", "Start Here", "1", self.set_start),
+            (("a", "Choose Existing MP4", "A", self.choose), ("1", "Start Here", "1", self.set_start),
              ("2", "End Here", "2", self.set_end), ("t", "Practice", "T", self.rehearse),
              ("r", "Record This Part", "R", self.record), ("s", "Stop", "S", self.stop)),
             (("p", "Listen Back", "P", self.preview), ("k", "Keep This Take", "K", self.keep),
@@ -79,6 +80,8 @@ class NarrationDialog:
         self.window.wait_visibility()
         self.window.grab_set()
         self.window.focus_set()
+        if movie is not None:
+            self.open_movie(movie)
 
     def tell(self, message):
         self.status.configure(text=message)
@@ -148,9 +151,10 @@ class NarrationDialog:
     def choose(self):
         path = filedialog.askopenfilename(parent=self.window, title="Choose a finished movie", initialdir=self.folder,
                                           filetypes=[("MP4 movies", "*.mp4")])
-        if not path or not self.can_discard():
-            return
-        movie = Path(path)
+        if path and self.can_discard():
+            self.open_movie(Path(path))
+
+    def open_movie(self, movie):
         reader = cv2.VideoCapture(str(movie))
         fps, frames = reader.get(cv2.CAP_PROP_FPS), reader.get(cv2.CAP_PROP_FRAME_COUNT)
         if not reader.isOpened() or not math.isfinite(fps) or fps <= 0 or not math.isfinite(frames) or frames < 1:
@@ -338,8 +342,11 @@ class NarrationDialog:
     def saved(self, output):
         self.dirty = False
         self.tell(f"Movie saved! {output.name}")
-        self.notify(f"Narrated movie saved! {output.name}")
-        print(f"Narrated movie: {output}")
+        if self.on_movie_saved is not None:
+            self.on_movie_saved(output)
+        else:
+            self.notify(f"Narrated movie saved! {output.name}")
+            print(f"Narrated movie: {output}")
 
     def run_job(self, action, message, done, *args):
         self.tell(message)

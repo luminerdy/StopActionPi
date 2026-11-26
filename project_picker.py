@@ -7,8 +7,24 @@ from pathlib import Path
 from ui_controls import shortcut_button
 
 
+def choose_movie(root, projects, *, from_studio=False):
+    projects.mkdir(exist_ok=True)
+    if not from_studio:
+        return ProjectPicker(root, projects).choose()
+    dialog = tk.Toplevel(root)
+    dialog.transient(root)
+    try:
+        picker = ProjectPicker(dialog, projects, from_studio=True)
+        dialog.wait_visibility()
+        dialog.grab_set()
+        return picker.choose()
+    finally:
+        dialog.destroy()
+        root.focus_set()
+
+
 class ProjectPicker:
-    def __init__(self, root, projects):
+    def __init__(self, root, projects, *, from_studio=False):
         self.root = root
         self.projects = projects
         self.folder = None
@@ -68,7 +84,7 @@ class ProjectPicker:
                                           tone="normal" if self.recent else "primary", large=not self.recent)
         self.new_button.pack(side="left", padx=(0, 8))
         shortcut_button(tk, footer, "Open Movie Folder", "O", self.open_folder).pack(side="left")
-        shortcut_button(tk, footer, "Quit", "Esc", self.finish).pack(side="right")
+        shortcut_button(tk, footer, "Back to Movie" if from_studio else "Quit", "Esc", self.finish).pack(side="right")
 
         self.key_binding = root.bind("<KeyPress>", self.key_pressed)
         (self.listbox if self.listbox is not None else self.new_button).focus_set()
