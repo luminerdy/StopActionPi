@@ -6,6 +6,9 @@ projects/
 joined_images_*/
 .removed/
 .transitions.json
+.frame-order.json
+.photo-messages.json
+.photo-drawings.json
 *.mp4
 frame_*.png
 .env

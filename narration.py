@@ -1,11 +1,12 @@
 """Record, edit, and export the voice track for a finished MP4."""
 
-from datetime import datetime
 from pathlib import Path
 import re
 import subprocess
 from tempfile import TemporaryDirectory
 import wave
+
+from movie_output import publish_movie
 
 
 SAMPLE_RATE = 48000
@@ -91,12 +92,7 @@ def replace_section(working, take, start, end, output):
 
 
 def save_narrated_movie(movie, audio, folder):
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output = folder / f"narrated_{stamp}.mp4"
-    partial = folder / f"narrated_{stamp}.partial.mp4"
-    try:
-        mux_narration(movie, audio, partial)
-        partial.rename(output)
-    finally:
-        partial.unlink(missing_ok=True)
-    return output
+    with TemporaryDirectory(prefix=".saving-narration-", dir=folder) as directory:
+        staged = Path(directory) / "movie.mp4"
+        mux_narration(movie, audio, staged)
+        return publish_movie(staged, folder, "Narrated")

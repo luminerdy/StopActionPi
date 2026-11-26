@@ -70,6 +70,53 @@ def shortcut_button(tk, parent, label, key, command, *, tone="normal", space_act
     return button
 
 
+def choose_movie_speed(tk, parent, current):
+    from tkinter import simpledialog
+
+    minimum, maximum = 2, 32
+
+    class SpeedDialog(simpledialog.Dialog):
+        background = "#202a39"
+
+        def body(self, panel):
+            self.configure(bg=self.background)
+            panel.configure(bg=self.background, padx=17, pady=12)
+            self.speed = tk.IntVar(master=self, value=max(minimum, min(maximum, current)))
+            self.readout = tk.StringVar(master=self)
+            self.update_readout()
+            tk.Label(panel, textvariable=self.readout, bg=self.background, fg="#f4f7fc",
+                     font=("TkDefaultFont", 16, "bold")).pack()
+            tk.Label(panel, text="Use the arrow keys or drag to change the speed.",
+                     bg=self.background, fg="#bdcbe0").pack(pady=(4, 7))
+            scale = tk.Scale(panel, from_=minimum, to=maximum, resolution=1, orient="horizontal",
+                             tickinterval=6, showvalue=False, length=300, variable=self.speed,
+                             command=self.update_readout, bg=self.background, fg="#f4f7fc",
+                             troughcolor="#141a24", activebackground="#82edcf", highlightthickness=0)
+            scale.pack(fill="x")
+            labels = tk.Frame(panel, bg=self.background)
+            labels.pack(fill="x")
+            for text, side in (("Slower", "left"), ("Faster", "right")):
+                tk.Label(labels, text=text, bg=self.background, fg="#bdcbe0").pack(side=side)
+            return scale
+
+        def update_readout(self, value=None):
+            self.readout.set(f"{self.speed.get()} photos per second")
+
+        def buttonbox(self):
+            box = tk.Frame(self, bg=self.background)
+            box.pack(fill="x", padx=17, pady=(0, 12))
+            shortcut_button(tk, box, "Use Speed", "Enter", self.ok, tone="primary").pack(side="left")
+            shortcut_button(tk, box, "Cancel", "Esc", self.cancel).pack(side="right")
+            self.bind("<Return>", self.ok)
+            self.bind("<KP_Enter>", self.ok)
+            self.bind("<Escape>", self.cancel)
+
+        def apply(self):
+            self.result = self.speed.get()
+
+    return SpeedDialog(parent, title="Movie Speed").result
+
+
 class ButtonRow:
     def __init__(self, tk, parent, background):
         self.frame = tk.Frame(parent, bg=background, height=1)

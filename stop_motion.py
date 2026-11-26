@@ -2,7 +2,6 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 import shutil
@@ -15,11 +14,16 @@ from time import monotonic
 import cv2
 
 from clip_joiner import IMAGE_SUFFIXES, ClipJoinDialog, ImageJoinDialog
+from movie_output import publish_movie
+from photo_drawings import draw_strokes, project_drawings, save_drawings
+from photo_messages import draw_message, hold_frames, project_messages, save_messages
+from photo_sequence import MAX_COPIES, duplicate_photo, order_photos, save_photo_order
 from transitions import MAX_FADE_SECONDS, blend_frame, fade_frame_count, neighbor_pair, project_fades, save_fades
-from ui_controls import ButtonRow, set_button_label, shortcut_button
+from ui_controls import ButtonRow, choose_movie_speed, set_button_label, shortcut_button
 
 
 REMOVED_DIR = ".removed"
+SHIFT_MASK = 0x0001
 
 
 def frame_number(path):
@@ -44,7 +48,7 @@ def project_frames(folder):
     frames.sort(key=frame_number)
     if len(set(map(frame_number, frames))) != len(frames):
         raise ValueError("More than one photo uses the same frame number in this project.")
-    return frames
+    return order_photos(folder, frames)
 
 
 def export_movie(folder, fps):
@@ -55,26 +59,25 @@ def export_movie(folder, fps):
         raise ValueError("Capture at least one frame first.")
     if not shutil.which("ffmpeg"):
         raise ValueError("FFmpeg is missing. Install it with: sudo apt install ffmpeg")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output = folder / f"movie_{stamp}_{fps}fps.mp4"
-    partial = folder / f"movie_{stamp}.partial.mp4"
-    output_options = [
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(partial),
-    ]
-    try:
-        fades = project_fades(folder, frames)
-        if fades:
-            export_with_fades(frames, fades, fps, output_options)
-        else:
-            export_photo_sequence(folder, frames, fps, output_options)
-        partial.rename(output)
-    except subprocess.CalledProcessError as error:
-        raise ValueError(f"Export failed: {error.stderr.strip()}") from error
-    finally:
-        partial.unlink(missing_ok=True)
-    return output
+    with TemporaryDirectory(prefix=".saving-movie-", dir=folder) as directory:
+        staged = Path(directory) / "movie.mp4"
+        output_options = [
+            "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(staged),
+        ]
+        try:
+            fades = project_fades(folder, frames)
+            messages = project_messages(folder)
+            drawings = project_drawings(folder)
+            overlays = messages.keys() | drawings.keys()
+            if fades or any(photo.name in overlays for photo in frames):
+                export_edited_movie(frames, fades, messages, drawings, fps, output_options)
+            else:
+                export_photo_sequence(folder, frames, fps, output_options)
+        except subprocess.CalledProcessError as error:
+            raise ValueError(f"Export failed: {error.stderr.strip()}") from error
+        return publish_movie(staged, folder, f"{fps}fps")
 
 
 def export_photo_sequence(folder, frames, fps, output_options):
@@ -100,27 +103,33 @@ def export_photo_sequence(folder, frames, fps, output_options):
         subprocess.run(command, cwd=directory, check=True, capture_output=True, text=True)
 
 
-def export_with_fades(frames, fades, fps, output_options):
-    previous = read_photo(frames[0])
-    height, width = previous.shape[:2]
+def export_edited_movie(frames, fades, messages, drawings, fps, output_options):
+    photo = read_drawn_photo(frames[0], drawings)
+    height, width = photo.shape[:2]
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-n", "-nostdin",
         "-f", "rawvideo", "-pixel_format", "bgr24", "-video_size", f"{width}x{height}",
         "-framerate", str(fps), "-i", "pipe:0", *output_options,
     ]
-    # Stream the blends so a long fade does not fill the project with temporary PNGs.
+    # Stream holds and blends without making temporary image files.
     with TemporaryFile() as errors, subprocess.Popen(command, stdin=subprocess.PIPE, stderr=errors) as encoder:
         interrupted = False
         try:
             with encoder.stdin as pipe:
-                pipe.write(previous.tobytes())
-                for index, photo in enumerate(frames[1:]):
-                    current = fit_movie_frame(read_photo(photo), width, height)
-                    count = fade_frame_count(fades.get(neighbor_pair(frames, index), 0), fps)
-                    for step in range(1, count + 1):
-                        pipe.write(blend_frame(previous, current, step, count).tobytes())
-                    pipe.write(current.tobytes())
-                    previous = current
+                for index, path in enumerate(frames):
+                    message = messages.get(path.name)
+                    still = fit_movie_frame(draw_message(photo, message), width, height).tobytes()
+                    for _ in range(hold_frames(message, fps)):
+                        pipe.write(still)
+                    if index + 1 < len(frames):
+                        following = read_drawn_photo(frames[index + 1], drawings)
+                        count = fade_frame_count(fades.get(neighbor_pair(frames, index), 0), fps)
+                        if count:
+                            before = fit_movie_frame(photo, width, height)
+                            after = fit_movie_frame(following, width, height)
+                            for step in range(1, count + 1):
+                                pipe.write(blend_frame(before, after, step, count).tobytes())
+                        photo = following
         except BrokenPipeError:
             interrupted = True
         except BaseException:
@@ -137,6 +146,10 @@ def read_photo(path):
     if photo is None:
         raise ValueError(f"Could not read {path.name}.")
     return photo
+
+
+def read_drawn_photo(path, drawings):
+    return draw_strokes(read_photo(path), drawings.get(path.name))
 
 
 def resize_to_fit(photo, width, height):
@@ -206,6 +219,8 @@ class Studio:
         self.folder = folder
         self.frames = frames
         self.fades = project_fades(folder, frames)
+        self.messages = project_messages(folder)
+        self.drawings = project_drawings(folder)
         stored_frames = frames + project_frames(folder / REMOVED_DIR)
         self.numbered_frames = any(not photo.stem.startswith("frame_") for photo in stored_frames)
         self.next_frame_number = max(map(frame_number, stored_frames), default=0) + 1
@@ -215,11 +230,14 @@ class Studio:
         self.last_photo = read_photo(frames[-1]) if frames else None
         self.review_index = None
         self.review_photo = None
+        self.drawn_photo = None
+        self.review_display = None
         self.blended_photo = None
         self.play_job = None
         self.play_mode = None
         self.resume_mode = "all"
         self.export_job = None
+        self.duplicate_job = None
         self.join_dialog = None
         self.narration_dialog = None
         self.ghost = False
@@ -312,9 +330,14 @@ class Studio:
                 ("cancel_retake", "Keep Last Photo", "Esc", "escape", "normal"),
             ), (
                 ("replay", "Replay Last 6", "L", "l", "normal"),
-                ("speed", "Speed · Slow", "S", "s", "normal"),
+                ("speed", "Speed", "S", "s", "normal"),
                 ("retake", "Retake Last", "R", "r", "normal"),
                 ("fade", "Fade to Next Photo", "F", "f", "normal"),
+                ("duplicate", "Duplicate Photo", "D", "d", "normal"),
+                ("message", "Add Message", "T", "t", "normal"),
+                ("draw", "Draw on Photo", "B", "b", "normal"),
+                ("earlier", "Move Earlier", "Shift+Left", "shift-left", "normal"),
+                ("later", "Move Later", "Shift+Right", "shift-right", "normal"),
                 ("remove", "Remove Photo", "Delete", "delete", "normal"),
                 ("tools", "Movie Tools", "M", "m", "normal"),
                 ("display", "Full Screen", "F11", "f11", "normal"),
@@ -343,15 +366,15 @@ class Studio:
     def update_controls(self):
         count = len(self.frames)
         fade_frames = sum(fade_frame_count(seconds, self.fps) for seconds in self.fades.values())
-        self.count.configure(text=f"{count} photos  |  {(count + fade_frames) / self.fps:.1f} sec at {self.fps} fps")
+        still_frames = sum(hold_frames(self.messages.get(photo.name), self.fps) for photo in self.frames)
+        self.count.configure(text=f"{count} photos  |  {(still_frames + fade_frames) / self.fps:.1f} sec at {self.fps} fps")
         if self.confirming_removal:
             self.heading.configure(text=f"Remove photo {self.review_index + 1}?")
             self.show_actions(("keep_photo", "confirm_remove"))
             return
         set_button_label(self.buttons["overlay"], "Hide Last Photo" if self.ghost else "Show Last Photo")
         set_button_label(self.buttons["tools"], "Hide Movie Tools" if self.tools_open else "Movie Tools")
-        speed = {6: "Slow", 12: "Normal"}.get(self.fps, f"{self.fps} fps")
-        set_button_label(self.buttons["speed"], f"Speed · {speed}")
+        set_button_label(self.buttons["speed"], f"Speed · {self.fps} fps")
         tools = ("join_movies", "join_folders", "voice") if self.tools_open else ()
         if self.review_index is not None:
             title = {"all": "Playing movie", "recent": "Playing last few"}.get(self.play_mode, "Review photos")
@@ -361,11 +384,20 @@ class Studio:
             set_button_label(self.buttons["play_here"], label)
             self.set_button_state("previous", self.review_index > 0)
             self.set_button_state("next", not at_end)
-            self.set_button_state("fade", not at_end and self.export_job is None)
-            self.set_button_state("remove", self.export_job is None)
-            self.set_button_state("save", self.export_job is None)
-            self.show_actions(("camera", "previous", "next", "play_here", "save"),
-                              ("fade", "remove", "replay", "speed", "tools", "display", "quit"), tools)
+            can_edit = self.export_job is None and self.duplicate_job is None
+            self.set_button_state("fade", not at_end and can_edit)
+            self.set_button_state("earlier", self.review_index > 0 and can_edit)
+            self.set_button_state("later", not at_end and can_edit)
+            has_message = self.frames[self.review_index].name in self.messages
+            set_button_label(self.buttons["message"], "Edit Message" if has_message else "Add Message")
+            for action in ("duplicate", "message", "draw", "remove", "save"):
+                self.set_button_state(action, can_edit)
+            self.show_actions(
+                ("camera", "previous", "next", "play_here", "save"),
+                ("earlier", "later", "duplicate", "message", "draw", "fade", "remove",
+                 "replay", "speed", "tools", "display", "quit"),
+                tools,
+            )
         elif self.retake:
             self.heading.configure(text=f"Retake photo {count}")
             self.set_button_state("save_retake", self.export_job is None)
@@ -395,7 +427,7 @@ class Studio:
 
     def update_picture(self, event=None):
         if self.review_index is not None:
-            photo = self.review_photo if self.blended_photo is None else self.blended_photo
+            photo = self.review_display if self.blended_photo is None else self.blended_photo
         else:
             photo = self.live_photo
             if self.ghost and photo is not None and self.last_photo is not None:
@@ -431,6 +463,19 @@ class Studio:
     def set_fullscreen(self, fullscreen):
         self.root.attributes("-fullscreen", fullscreen)
         self.label_display_button(fullscreen)
+
+    def change_speed(self):
+        was_playing = self.play_mode is not None
+        if was_playing:
+            self.resume_mode = self.play_mode
+            self.stop_playback()
+            self.update_controls()
+            self.tell("Playback paused.")
+        speed = choose_movie_speed(self.tk, self.root, self.fps)
+        if speed is not None:
+            self.fps = speed
+            self.update_controls()
+            self.tell(f"Movie speed set to {speed} fps.")
 
     def update_strip(self):
         start = max(0, len(self.frames) - self.RECENT_COUNT)
@@ -515,7 +560,10 @@ class Studio:
 
     def show_photo(self, index):
         try:
-            photo = self.last_photo if index == len(self.frames) - 1 else read_photo(self.frames[index])
+            path = self.frames[index]
+            photo = self.last_photo if index == len(self.frames) - 1 else read_photo(path)
+            drawn = draw_strokes(photo, self.drawings.get(path.name))
+            display = draw_message(drawn, self.messages.get(path.name))
         except ValueError as error:
             self.stop_playback()
             self.update_controls()
@@ -523,6 +571,8 @@ class Studio:
             return False
         self.retake = False
         self.review_photo = photo
+        self.drawn_photo = drawn
+        self.review_display = display
         self.review_index = index
         self.update_controls()
         self.update_strip()
@@ -542,6 +592,162 @@ class Studio:
                 self.tell(f"{seconds:g} sec fade to the next photo. Press F to change it.")
             else:
                 self.tell("Use the arrow keys to compare photos. Press F to fade to the next photo.")
+
+    def move_review_photo(self, offset):
+        index = self.review_index
+        if index is None:
+            self.tell("Use Review Photos to pick the photo you want to move.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before moving photos.")
+            return
+        target = index + offset
+        if not 0 <= target < len(self.frames):
+            self.tell("This photo is already first." if target < 0 else "This photo is already last.")
+            return
+
+        self.stop_playback()
+        self.resume_mode = "all"
+        frames = self.frames.copy()
+        frames[index], frames[target] = frames[target], frames[index]
+        try:
+            last_photo = self.last_photo if frames[-1] == self.frames[-1] else read_photo(frames[-1])
+            fades = project_fades(self.folder, frames)
+            save_photo_order(self.folder, frames)
+        except (OSError, ValueError, cv2.error) as error:
+            self.update_controls()
+            self.tell("Could not move the photo. The order is unchanged.")
+            print(error, file=sys.stderr)
+            return
+
+        skipped_fade = self.fades.keys() - fades.keys()
+        self.frames = frames
+        self.last_photo = last_photo
+        self.fades = fades
+        self.strip_start = None
+        if self.show_photo(target):
+            message = f"Moved photo to position {target + 1} of {len(frames)}."
+            if skipped_fade:
+                message += " Fades play only between their original neighbors."
+            self.tell(message)
+
+    def duplicate_review_photo(self):
+        from tkinter import simpledialog
+
+        index = self.review_index
+        if index is None:
+            self.tell("Use the arrow keys to pick the photo you want to duplicate.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before duplicating a photo.")
+            return
+        self.stop_playback()
+        self.update_controls()
+        count = simpledialog.askinteger(
+            "Duplicate Photo",
+            f"How many extra copies of photo {index + 1}?\nThe copies go right after it.",
+            parent=self.root, initialvalue=1, minvalue=1, maxvalue=MAX_COPIES,
+        )
+        if count is None:
+            return
+        self.duplicate_job = self.exporter.submit(
+            duplicate_photo, self.folder, tuple(self.frames), index, count,
+            self.next_frame_number, self.numbered_frames, self.fades,
+        )
+        self.update_controls()
+        self.tell("Making photo copies...")
+        self.root.after(50, self.check_duplicate, index)
+
+    def check_duplicate(self, index):
+        if not self.duplicate_job.done():
+            self.root.after(50, self.check_duplicate, index)
+            return
+        job = self.duplicate_job
+        self.duplicate_job = None
+        try:
+            copies, self.fades = job.result()
+        except (OSError, ValueError) as error:
+            self.update_controls()
+            self.tell("Could not copy the photo. Check that the project folder has space and can be written to.")
+            print(error, file=sys.stderr)
+            return
+        self.frames[index + 1:index + 1] = copies
+        self.next_frame_number += len(copies)
+        self.strip_start = None
+        self.show_photo(index)
+        count = len(copies)
+        label = "copy" if count == 1 else "copies"
+        self.tell(f"Added {count} {label} after photo {index + 1}. Press Space to play from here.")
+
+    def edit_message(self):
+        from message_dialog import MessageDialog
+
+        index = self.review_index
+        if index is None:
+            self.tell("Use Review Photos to pick a photo for your message.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before editing a message.")
+            return
+        self.stop_playback()
+        self.resume_mode = "all"
+        self.update_controls()
+        name = self.frames[index].name
+        dialog = MessageDialog(self.root, self.drawn_photo, self.messages.get(name), self.photo_image)
+        if dialog.result is None:
+            return
+        (message,) = dialog.result
+        messages = self.messages.copy()
+        if message is None:
+            messages.pop(name, None)
+        else:
+            messages[name] = message
+        try:
+            save_messages(self.folder, messages)
+        except OSError as error:
+            self.tell("Could not save your change. Check that the project folder can be written to.")
+            print(error, file=sys.stderr)
+            return
+        self.messages = messages
+        if self.show_photo(index):
+            if message is None:
+                self.tell("Message removed.")
+            else:
+                self.tell(f"Message saved. It will show for {message.seconds} sec in your movie.")
+
+    def edit_drawing(self):
+        from drawing_dialog import DrawingDialog
+
+        index = self.review_index
+        if index is None:
+            self.tell("Use Review Photos to pick a photo to draw on.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before editing a drawing.")
+            return
+        self.stop_playback()
+        self.resume_mode = "all"
+        self.update_controls()
+        name = self.frames[index].name
+        original = self.drawings.get(name, ())
+        dialog = DrawingDialog(self.root, self.review_photo, original, self.messages.get(name), self.photo_image)
+        strokes = dialog.result
+        if strokes is None or strokes == original:
+            return
+        drawings = self.drawings.copy()
+        if strokes:
+            drawings[name] = strokes
+        else:
+            drawings.pop(name, None)
+        try:
+            save_drawings(self.folder, drawings)
+        except OSError as error:
+            self.tell("Could not save your change. Check that the project folder can be written to.")
+            print(error, file=sys.stderr)
+            return
+        self.drawings = drawings
+        if self.show_photo(index):
+            self.tell("Drawing saved." if strokes else "Drawing removed.")
 
     def fade_after(self, index):
         if index + 1 < len(self.frames):
@@ -614,15 +820,16 @@ class Studio:
                 return
         if self.show_photo(index):
             rate = min(self.fps, 6) if self.play_mode == "recent" else self.fps
-            next_due = due + 1 / rate
+            message = self.messages.get(self.frames[index].name)
+            next_due = due + hold_frames(message, rate) / rate
             count = fade_frame_count(self.fade_after(index), rate)
             if not count:
                 self.queue_playback(next_due, self.play_frame, index + 1, first, next_due)
                 return
             try:
                 height, width = read_photo(self.frames[0]).shape[:2]
-                before = fit_movie_frame(self.review_photo, width, height)
-                after = fit_movie_frame(read_photo(self.frames[index + 1]), width, height)
+                before = fit_movie_frame(self.drawn_photo, width, height)
+                after = fit_movie_frame(read_drawn_photo(self.frames[index + 1], self.drawings), width, height)
             except (ValueError, cv2.error) as error:
                 self.stop_playback()
                 self.update_controls()
@@ -648,6 +855,8 @@ class Studio:
         self.stop_playback()
         self.review_index = None
         self.review_photo = None
+        self.drawn_photo = None
+        self.review_display = None
         self.retake = False
         self.update_controls()
         self.update_strip()
@@ -759,12 +968,15 @@ class Studio:
                 self.held_keys[key] = None
             return "break"
         self.held_keys[key] = None
-        self.perform_action(key)
+        action = f"shift-{key}" if key in ("left", "right") and event.state & SHIFT_MASK else key
+        self.perform_action(action)
         return "break"
 
     def perform_action(self, key):
         if key == "f11":
             self.set_fullscreen(not self.root.attributes("-fullscreen"))
+            return
+        if self.duplicate_job is not None:
             return
         if self.confirming_removal:
             if key in ("return", "kp_enter"):
@@ -797,15 +1009,22 @@ class Studio:
                 self.tell("Line up your next shot with the faint copy of the last photo.")
         elif key in ("left", "right"):
             self.step(-1 if key == "left" else 1)
+        elif key in ("shift-left", "shift-right"):
+            self.move_review_photo(-1 if key == "shift-left" else 1)
         elif key in ("delete", "kp_delete"):
             self.ask_remove_photo()
+        elif key == "d":
+            self.duplicate_review_photo()
+        elif key == "t":
+            self.edit_message()
+        elif key == "b":
+            self.edit_drawing()
         elif key == "f":
             self.edit_fade()
         elif key in ("p", "l"):
             self.play("all" if key == "p" else "recent")
         elif key == "s":
-            self.fps = 12 if self.fps == 6 else 6
-            self.update_controls()
+            self.change_speed()
         elif key == "r":
             self.start_retake()
         elif key == "e":
@@ -837,6 +1056,9 @@ class Studio:
         self.held_keys.clear()
 
     def close(self):
+        if self.duplicate_job is not None:
+            self.tell("Your photo copies are still saving. Wait a moment before quitting.")
+            return
         if self.export_job is not None:
             self.tell("Your MP4 is still saving. Wait a moment before quitting.")
             return

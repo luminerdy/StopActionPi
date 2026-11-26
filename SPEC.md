@@ -12,13 +12,17 @@ StopActionPi is a small stop motion studio for a Raspberry Pi 500 and a USB webc
 | Take a photo | Space saves one clean PNG and updates the thumbnail strip. Holding Space does not add extra photos. |
 | Remember what moved | O overlays the newest photo on the live image. The arrow keys let the maker flip between saved photos. |
 | See the motion | P plays from the first photo to the latest. L loops the last six at up to six photos per second. Space pauses or resumes review. Esc returns to the camera. |
-| Change the speed | S switches between 6 and 12 fps for full playback and the next MP4 export. Show the selected speed and estimated movie length. |
+| Change the speed | S opens a slider for choosing a whole-number speed from 2 to 32 fps for full playback and the next MP4 export. Show the selected speed and estimated movie length. |
 | Fix a shot | R arms a retake of the last photo. Space saves the replacement to the same slot. Esc cancels and keeps the original. |
+| Hold a shot | During review, D asks for 1 to 1,000 extra copies of the selected photo. Insert the copies right after the selected photo. An outgoing fade moves after the last copy. |
+| Reorder shots | During review, Move Earlier and Move Later (Shift+Left and Shift+Right) move the selected photo one position at a time. Keep that photo selected and save the new order immediately. |
+| Put words on a photo | T opens a live preview with editable text, top or bottom placement, paired styles, two color palettes, and a hold time from 1 to 30 seconds. The default is a 3-second hold. Reopen the editor to change or remove the message. |
+| Draw on a photo | B opens a mouse or touchpad drawing surface with the message color palette and three brush sizes. Use Undo or Ctrl+Z to take back a stroke. Clear Drawing with Save Drawing removes the drawing. |
 | Remove a shot | During review, Delete asks to remove the selected photo. Enter removes it from the project sequence and Esc keeps it. The original remains in the local `.removed` folder. |
 | Fade between shots | F sets the duration of a crossfade into the next photo. A fade adds blended frames to playback and export while preserving the source photos. Enter zero to remove it. |
-| Make a movie | E writes a silent H.264 MP4 at the selected rate. Playback and export default to 6 photos per second. Exports get distinct filenames. |
+| Make a movie | E writes a silent H.264 MP4 at the selected rate. Playback and export default to 6 photos per second. |
 | Join finished movies | J opens a list where makers pick and order two or more MP4s from any project. Join writes a new silent MP4 in the current project. The original clips keep their timing and remain on disk. |
-| Join photo folders | I opens a list of folders. Join copies supported images in folder order and sorts each folder's files by name with numbers in sequence. The new folder starts at 000 and can be opened as a project for review and export. |
+| Join photo folders | I opens a list of folders. Join copies supported images using each folder's saved photo order when available and numeric filename order otherwise. The new folder starts at 000 and can be opened as a project for review and export. |
 | Narrate a movie | N opens the Recording Studio. Makers scrub a finished MP4, mark a section, and rehearse with a lead-in. R starts a countdown and records the selected section. P previews the pending take, K keeps it, and E saves a new MP4. The rest of the narration stays in place. |
 | Continue tomorrow | Reopen the same project folder and capture continues after the last saved photo. |
 
@@ -28,9 +32,12 @@ StopActionPi is a small stop motion studio for a Raspberry Pi 500 and a USB webc
 - Camera, review, retake, and removal confirmation have their own button sets. A button and its key call the same action. Movie Tools keeps joins and narration together.
 - The camera preview pauses updates during resizing. Once the window settles, the app redraws the photo and all visible buttons.
 - OpenCV reads frames in the background so a slow webcam does not hold up review. Tk draws the preview and keyboard controls. FFmpeg writes H.264 MP4 files with AAC audio for narrated exports.
-- Camera projects save numbered PNGs. Joined photo folders preserve the source formats and use names starting at `000`. Deleting a photo moves it into `.removed/`, and playback and exports use the remaining photos in numeric order.
+- Camera projects save numbered PNGs. Joined photo folders preserve the source formats and use names starting at `000`. Deleting a photo moves it into `.removed/`. Duplicating a photo creates independent image files. Duplicating and reordering save the photo sequence in the project's `.frame-order.json`. Review, playback, export, and photo-folder joins use the saved sequence or fall back to filename order.
 - Fades are saved in the project's `.transitions.json` with the two photo filenames and the duration in seconds. Playback and export use a fade only while those photos are adjacent. Export streams the blended frames to FFmpeg.
+- Messages are saved in `.photo-messages.json` by photo filename. Pillow draws messages in review, preview, and MP4. The message is shown throughout its photo's hold. Fades blend the adjacent photos after the hold.
+- Drawings are saved in `.photo-drawings.json` as strokes with positions relative to each photo. Review, playback, and export render the drawings beneath any messages. Drawings crossfade with their photos.
 - The Recording Studio loads existing narration or starts with a silent track. Retakes are temporary until kept. A kept take replaces only the recorded part of its marked section. Saving writes a new MP4 with the edited audio and copies the original video stream.
+- Camera exports, joined movies, and narrated movies use the project folder name, local date and time, and an export label in the filename. When a filename is taken, saving adds the next available number.
 - Project folders remain local. The installed studio works without an account or internet connection.
 
 ## Source guide
@@ -38,6 +45,12 @@ StopActionPi is a small stop motion studio for a Raspberry Pi 500 and a USB webc
 | File | Role |
 | --- | --- |
 | [`stop_motion.py`](stop_motion.py) | Webcam capture, frame storage, review, and MP4 export |
+| [`movie_output.py`](movie_output.py) | Project-based MP4 names and collision handling |
+| [`photo_sequence.py`](photo_sequence.py) | Photo duplication, reordering, and saved sequence order |
+| [`photo_messages.py`](photo_messages.py) | Message storage, rendering, and timing |
+| [`message_dialog.py`](message_dialog.py) | Message editor, color swatches, and preview |
+| [`photo_drawings.py`](photo_drawings.py) | Saved strokes and drawing rendering |
+| [`drawing_dialog.py`](drawing_dialog.py) | Freehand drawing, brush controls, and undo |
 | [`project_picker.py`](project_picker.py) | Welcome screen and project selection |
 | [`install_desktop.py`](install_desktop.py) | Per-user desktop icon, menu entry, and autostart |
 | [`transitions.py`](transitions.py) | Saved fade settings and blending between adjacent photos |
@@ -56,3 +69,7 @@ StopActionPi is a small stop motion studio for a Raspberry Pi 500 and a USB webc
 6. Remove the middle photo in review. Play and export the remaining two in order. Quit and reopen the project, then capture a new photo. The new shot should follow the two remaining photos.
 7. Join two exports at different speeds. Check that they appear in the chosen order and keep their original pacing. Join two photo folders and verify that numbering continues across the folder boundary.
 8. Open an exported MP4 in the Recording Studio, mark a short section, and rehearse. Record it, listen back, and keep the take. Save and reopen the narrated MP4. Replace a second section and check that the first take is still in place.
+9. In review, select a photo and use D to add three copies. Reopen the project and verify the copies still follow the selected photo. Remove one copy and confirm the other copies and original are still in the movie.
+10. Move a photo earlier with the button, then later with Shift+Right. Verify each move keeps the photo selected. Reopen the project and export an MP4 to check the saved order.
+11. Add a message with T. Pick a style, change a color and the hold time, and export. Reopen the project, verify the settings, and remove the message in the editor.
+12. Open B, draw two strokes in different colors and sizes, undo one, and save. Verify the drawing after reopening and in the MP4. Clear the drawing and save again.

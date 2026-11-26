@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from tempfile import TemporaryDirectory
 
+from movie_output import publish_movie
+from photo_sequence import order_photos
 from ui_controls import ButtonRow, shortcut_button
 
 
@@ -19,9 +21,6 @@ def join_clips(clips, folder):
     if not shutil.which("ffmpeg"):
         raise ValueError("FFmpeg is missing. Install it with: sudo apt install ffmpeg")
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output = folder / f"joined_{stamp}.mp4"
-    partial = folder / f"joined_{stamp}.partial.mp4"
     command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-n"]
     filters = []
     for index, clip in enumerate(clips):
@@ -39,16 +38,15 @@ def join_clips(clips, folder):
     command.extend([
         "-filter_complex_threads", "1", "-filter_complex", ";".join(filters),
         "-map", "[joined]", "-r", "24", "-c:v", "libx264", "-preset", "veryfast",
-        "-crf", "18", "-movflags", "+faststart", str(partial),
+        "-crf", "18", "-movflags", "+faststart",
     ])
-    try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
-        partial.rename(output)
-    except subprocess.CalledProcessError as error:
-        raise ValueError(f"Could not join the clips.\n{error.stderr.strip()}") from error
-    finally:
-        partial.unlink(missing_ok=True)
-    return output
+    with TemporaryDirectory(prefix=".joining-movie-", dir=folder) as directory:
+        staged = Path(directory) / "movie.mp4"
+        try:
+            subprocess.run([*command, str(staged)], check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as error:
+            raise ValueError(f"Could not join the clips.\n{error.stderr.strip()}") from error
+        return publish_movie(staged, folder, "Joined")
 
 
 def image_sort_key(path):
@@ -69,7 +67,7 @@ def join_image_folders(folders, folder):
         )
         if not images:
             raise ValueError(f"No supported photos in {source.name}.")
-        photos.extend(images)
+        photos.extend(order_photos(source, images))
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     output = folder / f"joined_images_{stamp}"
