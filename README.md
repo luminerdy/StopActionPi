@@ -148,4 +148,6 @@ For flicker, use steady lighting and avoid changing daylight. Inspect available 
 
 See the [project specification and first run checks](SPEC.md) for behavior, file formats, and a guide to the source. See [LICENSE](LICENSE) for reuse terms.
 
+The [Camera, Review, and Finish implementation plan](SPEC.md#camera-review-and-finish-implementation-plan) describes the proposed layout and how to test it.
+
 See also [Logitech C270 specifications](https://support.logi.com/hc/en-001/articles/360023393913-Logitech-HD-Webcam-C270-Technical-Specifications) and [Raspberry Pi USB webcam documentation](https://www.raspberrypi.com/documentation/accessories/camera-software.html).

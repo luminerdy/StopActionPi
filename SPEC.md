@@ -73,3 +73,39 @@ StopActionPi is a small stop motion studio for a Raspberry Pi 500 and a USB webc
 10. Move a photo earlier with the button, then later with Shift+Right. Verify each move keeps the photo selected. Reopen the project and export an MP4 to check the saved order.
 11. Add a message with T. Pick a style, change a color and the hold time, and export. Reopen the project, verify the settings, and remove the message in the editor.
 12. Open B, draw two strokes in different colors and sizes, undo one, and save. Verify the drawing after reopening and in the MP4. Clear the drawing and save again.
+
+## Camera, Review, and Finish implementation plan
+
+Keep one window on one monitor. Make it easy to take the next photo, find a shot to fix, and finish a movie. A Pi layout check at 1280 × 720 counted 17 visible buttons in Review and 20 with Movie Tools open. The photo-editing controls wrapped onto three lines.
+
+### Layout
+
+| Where | On screen | Open as needed |
+| --- | --- | --- |
+| **Camera** | Large **Take Photo [Space]**, **Show Last Photo [O]**, **Replay Last 6 [L]**, **Review Photos**, and **Play Movie [P]**. | **Camera Tools** starts with **Retake Last [R]**. Camera setup controls can go here as they become available. |
+| **Review** | Large photo, clickable thumbnail strip, **Back to Camera [Esc]**, **Previous**, **Next**, and **Play From Here [Space]**. | **Edit Photo** groups **Move Earlier/Later**, **Duplicate Photo [D]**, **Remove Photo [Delete]**, **Message [T]**, **Draw [B]**, and **Fade to Next Photo [F]**. |
+| **Finish** | **Save MP4 [E]**, **Add My Voice [N]**, **Join Movies [J]**, and **Join Photo Folders [I]**. After a save, show the filename and offer **Watch Saved Movie** and **Show in Folder**. | A **Choose Existing MP4** path inside Recording Studio supports editing an earlier export. |
+
+Show the project name, photo count, estimated duration, and **Speed [S]** in the same place in Camera and Review. Keep Finish within reach from both views. Use **M** to open Finish and **Esc** to return to the previous view. Keep the direct keyboard shortcuts working with the panels closed. Put fullscreen and quit controls in the window header.
+
+### Implementation order
+
+1. **Rearrange the current controls.** In `stop_motion.py`, use the existing Camera and Review modes and move the secondary actions into Camera Tools, Edit Photo, and Finish. Reuse the keyboard dispatch and responsive button rows in `ui_controls.py`. Keep the thumbnail strip in the same place while moving between modes. Use the space freed by collapsing secondary controls for the photo. Route each button and shortcut through the same action.
+2. **Make Review faster to use.** Give each thumbnail a click target and keep the selected shot visible as the strip scrolls. Keep Left and Right for stepping and add Home and End for the first and last photo during review. Show compact message, drawing, and outgoing fade indicators on the relevant thumbnails. Offer **Undo Remove** immediately after a delete. Restore the archived file to its prior position and refresh the order, overlays, and any adjacent fade. Start with one undo for the latest removal in the current session. Stop offering it after a subsequent change to photo order.
+3. **Connect the finishing steps.** Use the existing export worker and project-based filenames. Report progress in Finish and enable the two saved-file actions only after a successful save. Pass the current cut to Recording Studio when the maker chooses **Add My Voice**. Use an export for that cut and speed, and make a fresh one if the photos or edits changed. Keep the option to choose a saved MP4 for an earlier cut or to continue an existing narration.
+4. **Add in-app project switching.** Place **My Movies** in the header. Reuse `project_picker.py` to reopen the picker, and release the old project's camera and playback resources when switching. Follow the current confirmation behavior for unsaved voice takes and allow active saves to finish before switching.
+
+### Check before installing
+
+- At 1280 × 720 and 1920 × 1080, test both window and fullscreen views. Confirm that Camera and Review give the picture more room, the thumbnail strip and main controls stay visible, and the panels fit.
+- With the keyboard alone, take photos, review them, replay recent shots, open the edit tools, change speed, save a movie, and return to the camera. Repeat with the mouse. Verify that typing in a dialog goes to the dialog.
+- Open an existing project with messages, drawings, reordered photos, and fades. Remove a marked photo, undo the removal, and confirm that it returns to the right position with its edits. Check the first and last photos and the case where all photos have been removed.
+- Save a regular, joined, and narrated movie. Confirm that the project name and timestamp appear, multiple saves have distinct names, and the saved-file actions open the correct output. Check that the narration shortcut can open the current cut and that older saved MP4s can still be selected.
+- Try the first three steps of the workflow with someone unfamiliar with the app. Ask them to take five photos, fix one, and find the exported MP4. Use the places they hesitate to decide what wording or placement needs work.
+
+### Follow-on features
+
+- **Steadier shots.** Check what focus, exposure, and white-balance controls each webcam exposes. Add a focus lock first, then a preview grid and adjustable strength for Show Last Photo.
+- **Easier timing.** Add **Hold This Photo** for a drawing or dramatic pause. Remember each project's chosen speed and start new projects at 6 fps. Add **Retake This Photo** for a shot in the middle of a sequence.
+- **Editable scene joins.** When joining photo folders, carry over the photo-linked messages and drawings, and remap fades to the renamed neighbor photos. For MP4 joins, preserve audio and the timing of 32 fps clips.
+- **Hide a support.** Save a clean photo of the set and use a brush to reveal that background where a clear LEGO support shows in the shot.
