@@ -75,18 +75,21 @@ def draw_strokes(photo, strokes):
     if not strokes:
         return photo
     result = photo.copy()
-    height, width = photo.shape[:2]
-    scale = (width - 1, height - 1)
     for stroke in strokes:
-        points = np.rint(np.asarray(stroke.points) * scale).astype(np.int32)
-        thickness = max(1, round(min(width, height) * THICKNESS[stroke.thickness]))
         color = tuple(int(stroke.color[i:i + 2], 16) for i in (5, 3, 1))
-        if len(points) == 1:
-            x, y = points[0]
-            if thickness == 1:
-                result[y, x] = color
-            else:
-                cv2.circle(result, (int(x), int(y)), thickness // 2, color, -1, cv2.LINE_AA)
-        else:
-            cv2.polylines(result, [points], False, color, thickness, cv2.LINE_AA)
+        paint_stroke(result, stroke, color)
     return result
+
+
+def paint_stroke(canvas, stroke, color):
+    height, width = canvas.shape[:2]
+    points = np.rint(np.asarray(stroke.points) * (width - 1, height - 1)).astype(np.int32)
+    thickness = max(1, round(min(width, height) * THICKNESS[stroke.thickness]))
+    if len(points) == 1:
+        x, y = points[0]
+        if thickness == 1:
+            canvas[y, x] = color
+        else:
+            cv2.circle(canvas, (int(x), int(y)), thickness // 2, color, -1, cv2.LINE_AA)
+    else:
+        cv2.polylines(canvas, [points], False, color, thickness, cv2.LINE_AA)

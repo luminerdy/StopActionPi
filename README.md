@@ -5,7 +5,7 @@ Make a stop motion movie on a Raspberry Pi. Move a figure a little, take a photo
 ## What you need
 
 - A Raspberry Pi 500 running 64-bit Raspberry Pi OS Desktop. The app was tested on the Debian 13 (Trixie) release.
-- A monitor and USB webcam. The Logitech C270 was tested at 1280 × 720. A fixed camera and steady light help keep shots consistent.
+- A monitor, plus a USB webcam when taking photos. The Logitech C270 was tested at 1280 × 720. A fixed camera and steady light help keep shots consistent.
 - For narration, a microphone and an audio output you can listen to. The C270 has a built-in mic, and a monitor with HDMI speakers can play the preview.
 
 ## Install on the Pi
@@ -38,7 +38,7 @@ Running the installer again refreshes the desktop shortcut, menu entry, and auto
 
 Fix the camera in place and light the scene. From **Camera**, click **Take Photo** or press **Space**. Move your subject a little and take another one. Choose **Play Movie [P]** to see your photos move.
 
-In **Review Photos**, click a thumbnail or use the arrows to pick a photo. Open **Edit Photo [Enter]** for reordering, duplication, removal, messages, drawings, and fades. Press **Home** or **End** to jump to the first or last photo. The thumbnail markers **T**, **B**, and **F** show where you've added a message, a drawing, or an outgoing fade.
+In **Review Photos**, click a thumbnail or use the arrows to pick a photo. Open **Edit Photo [Enter]** to rearrange, hold, duplicate, remove, decorate, clean up, or fade photos. Press **Home** or **End** to jump to the first or last photo. Thumbnail markers show messages (**T**), drawings (**B**), holds (**H**), support cleanups (**U**), and outgoing fades (**F**).
 
 Open **Finish [M]** to save, narrate, or join movies and photo folders. **Save MP4 [E]** also opens Finish and starts saving. After a successful save, use **Watch Saved Movie** or **Show in Folder**.
 
@@ -50,8 +50,10 @@ Open **Finish [M]** to save, narrate, or join movies and photo folders. **Save M
 | **Home / End** | Jump to the first or last photo in review. |
 | **Shift+← / Shift+→** | Move the selected photo one spot earlier or later in the movie. |
 | **D** | Make extra copies of the selected photo and place them right after it. |
+| **H** | Hold the selected photo on screen for a chosen time. |
 | **T** | Add, edit, or remove a message on the selected photo. |
 | **B** | Draw on the selected photo or clear its drawing. |
+| **U** | Hide a support on the selected photo with the clean background. |
 | **Delete** | Remove the photo shown in review. Press **Enter** to remove it or **Esc** to keep it. |
 | **Ctrl+Z** | Bring back the most recently removed photo before making another change to the photo sequence. |
 | **Enter** | Show or hide Edit Photo tools during review. |
@@ -61,7 +63,9 @@ Open **Finish [M]** to save, narrate, or join movies and photo folders. **Save M
 | **S** | Choose any speed from 2 to 32 fps for full playback and the next MP4 export. Use the arrow keys or slider, then press **Enter**. |
 | **Esc** | Back out of the open panel, return to the camera, or cancel a retake. |
 | **C** | Open Camera Tools in the live view. |
-| **R** | Set up a retake. **Space** replaces the last photo and **Esc** keeps it. |
+| **K** | Check for a newly connected webcam. |
+| **G** | Save a clean background from the live camera. |
+| **R** | Retake the selected photo in Review, or the last photo from Camera. **Space** saves the replacement and **Esc** keeps the original. |
 | **E** | Save an MP4 in the project folder. |
 | **M** | Open or close Finish. |
 | **J** | Join two or more saved MP4s into one movie. |
@@ -77,13 +81,19 @@ With straight cuts, 60 photos make a 5-second movie at 12 fps or a 10-second mov
 
 ## Hold a pose longer
 
-In review, pick a photo with the arrow keys and choose **Duplicate Photo [D]**. Enter how many extra copies to add and press **Enter**. Entering `3` adds three copies right after the original. Each copy is a separate photo you can remove, and the copies stay in order when you reopen, play, or export the movie. If the original fades into the next shot, that fade plays after the last copy.
+Pick a photo in review and choose **Hold This Photo [H]**. Enter how long the photo should stay on screen, starting at 2 seconds. You can use a fraction such as `1.5` seconds. Choose **Save Hold**, or reopen the dialog and choose **Clear Hold** to remove it. Playback and MP4 export use the hold, and an outgoing fade starts after it. If the photo has a message, the longer of the hold and the message's **Show for** time applies.
+
+Choose **Duplicate Photo [D]** when you want separate copies you can edit individually. Entering `3` adds three copies right after the original. If the original fades into the next shot, that fade plays after the last copy.
 
 ## Reorder photos
 
 In review, pick a photo with the arrow keys. Click **Move Earlier** or **Move Later**, or hold **Shift** and press the left or right arrow. Each move changes the photo's position by one spot and keeps it selected so you can move it again. The new order saves immediately and is used for playback and the next MP4 export.
 
 An existing fade plays when its two photos are next to each other in the same order.
+
+## Retake a photo
+
+In Review, pick the photo you want to fix and choose **Edit Photo → Retake This Photo [R]**. The live camera shows a faint copy of the original so you can line up the shot. Use **O** to toggle that guide. Press **Space** to save the replacement in the same spot or **Esc** to keep the original and return to Review. From Camera, **Retake Last [R]** works on the last photo.
 
 ## Put a message on a photo
 
@@ -99,6 +109,14 @@ Choose a photo in review and press **B** or click **Draw on Photo**. Pick a colo
 
 To remove a drawing, reopen **Draw on Photo**, click **Clear Drawing**, then click **Save Drawing**. Drawings stay with their photos when reordered and appear in playback and exported MP4s. When the same photo has a message, the message appears above the ink and both show for the message's hold time.
 
+## Hide a support
+
+1. In **Camera Tools**, choose **Take Clean Background [G]** with the empty set in view. Keep the camera, set, and lights in place. The clean background is a reference for cleanup.
+2. Add the figure and support and take your photos. Put the support behind the character so the visible part crosses the background.
+3. In review, select a photo and choose **Hide the Support [U]**. Brush over the visible support to reveal the clean background. Use **Bring Back** to restore a spot you brushed by mistake, or **Undo [Ctrl+Z]** to undo a stroke. Choose **Save Cleanup** to keep the result.
+
+Use **Clear Cleanup** and then **Save Cleanup** to clear the brushes from that photo. Cleanups appear in review, playback, and exported MP4s. When switching to a different set or camera angle, finish cleaning up the earlier photos before taking a new reference. Saved cleanups keep the reference they used.
+
 ## Fade between photos
 
 In review, use the arrow keys to pick the photo where the fade should begin. Press **F** and enter the number of seconds. The fade blends that photo into the next one and adds that time to the movie, rounded to the nearest frame. Press **Space** to preview from the selected photo, **P** to play the full movie, or **E** to export it with the fade.
@@ -109,7 +127,7 @@ Fades are saved with the project. Press **F** again to change a fade, or enter `
 
 Press **J**, then **A** to add each MP4 you want to use. Clips can come from different project folders. They play from the top of the list down. Use the arrow keys to select a clip, **U** or **D** to move it, and **Delete** to take it out of the list. The clips on disk stay as they are.
 
-Press **Enter** to save a new MP4 labeled **Joined** in the current project folder. A clip exported at 6 fps stays slow beside one exported at 12 fps. The joined movie is silent, like the studio's individual exports.
+Press **Enter** to save a new MP4 labeled **Joined** in the current project folder. The join uses the fastest clip's frame rate and keeps each clip's pace. A 6 fps clip keeps its timing beside a 32 fps clip. If any clip has audio, the joined movie keeps that sound in order and plays silent clips as silence.
 
 ## Join photo folders
 
@@ -140,6 +158,10 @@ python3 stop_motion.py --project projects/first_movie --fps 12 --export-only
 ```
 
 Export-only works without a webcam or preview. Each export gets a new filename. Removed photos are skipped in playback and new exports. To recover one, quit the app, move its numbered image from the hidden `.removed` folder back into the project folder, and reopen the project. Frame exports are silent. Use the Recording Studio to make a copy with audio.
+
+## Edit without a camera
+
+Open a saved movie as usual. If a webcam is unplugged or unavailable, StopActionPi opens a project with saved photos in **Review**. You can still edit, play, join, and export movies. To resume shooting, plug in the webcam, go to **Camera**, and choose **Connect Camera [K]**.
 
 ## Camera troubleshooting
 

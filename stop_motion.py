@@ -2,6 +2,7 @@
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import lru_cache
 import os
 from pathlib import Path
@@ -11,16 +12,20 @@ import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory, TemporaryFile
 from threading import Event, Thread
 from time import monotonic
+from uuid import uuid4
 
 import cv2
+from numpy import ndarray
 
 from clip_joiner import IMAGE_SUFFIXES, ClipJoinDialog, ImageJoinDialog
 from movie_output import publish_movie
 from photo_drawings import draw_strokes, project_drawings, save_drawings
-from photo_messages import draw_message, hold_frames, project_messages, save_messages
+from photo_holds import hold_frame_count, project_holds, save_holds
+from photo_messages import draw_message, project_messages, save_messages
 from photo_sequence import MAX_COPIES, duplicate_photo, order_photos, save_photo_order
+from photo_support import CLEAN_BACKGROUNDS, SupportEdit, hide_support, project_support, read_clean_background, save_support
 from transitions import MAX_FADE_SECONDS, blend_frame, fade_frame_count, neighbor_pair, project_fades, read_fades, save_fades
-from ui_controls import ButtonRow, choose_movie_speed, set_button_label, shortcut_button
+from ui_controls import ButtonRow, choose_movie_speed, choose_photo_hold, set_button_label, shortcut_button
 
 
 REMOVED_DIR = ".removed"
@@ -72,9 +77,11 @@ def export_movie(folder, fps):
             fades = project_fades(folder, frames)
             messages = project_messages(folder)
             drawings = project_drawings(folder)
-            overlays = messages.keys() | drawings.keys()
-            if fades or any(photo.name in overlays for photo in frames):
-                export_edited_movie(frames, fades, messages, drawings, fps, output_options)
+            holds = project_holds(folder)
+            _, supports = project_support(folder)
+            edited = messages.keys() | drawings.keys() | holds.keys() | supports.keys()
+            if fades or any(photo.name in edited for photo in frames):
+                export_edited_movie(frames, fades, messages, drawings, holds, supports, fps, output_options)
             else:
                 export_photo_sequence(folder, frames, fps, output_options)
         except subprocess.CalledProcessError as error:
@@ -105,8 +112,8 @@ def export_photo_sequence(folder, frames, fps, output_options):
         subprocess.run(command, cwd=directory, check=True, capture_output=True, text=True)
 
 
-def export_edited_movie(frames, fades, messages, drawings, fps, output_options):
-    photo = read_drawn_photo(frames[0], drawings)
+def export_edited_movie(frames, fades, messages, drawings, holds, supports, fps, output_options):
+    photo = read_edited_photo(frames[0], drawings, supports)
     height, width = photo.shape[:2]
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-n", "-nostdin",
@@ -121,10 +128,10 @@ def export_edited_movie(frames, fades, messages, drawings, fps, output_options):
                 for index, path in enumerate(frames):
                     message = messages.get(path.name)
                     still = fit_movie_frame(draw_message(photo, message), width, height).tobytes()
-                    for _ in range(hold_frames(message, fps)):
+                    for _ in range(hold_frame_count(holds.get(path.name, 0), message, fps)):
                         pipe.write(still)
                     if index + 1 < len(frames):
-                        following = read_drawn_photo(frames[index + 1], drawings)
+                        following = read_edited_photo(frames[index + 1], drawings, supports)
                         count = fade_frame_count(fades.get(neighbor_pair(frames, index), 0), fps)
                         if count:
                             before = fit_movie_frame(photo, width, height)
@@ -150,8 +157,9 @@ def read_photo(path):
     return photo
 
 
-def read_drawn_photo(path, drawings):
-    return draw_strokes(read_photo(path), drawings.get(path.name))
+def read_edited_photo(path, drawings, supports):
+    cleaned = hide_support(read_photo(path), path.parent, supports.get(path.name))
+    return draw_strokes(cleaned, drawings.get(path.name))
 
 
 def resize_to_fit(photo, width, height):
@@ -189,26 +197,72 @@ def save_photo(path, photo, *, replace=False):
 
 
 class CameraFeed:
-    """Keep webcam reads from blocking Tk or slowing movie playback."""
+    """Own the webcam in a worker so projects can open without a camera."""
 
-    def __init__(self, camera):
+    def __init__(self, index):
         self.latest = None
+        self.state = "checking"
         self.finished = Event()
-        self.reader = Thread(target=self.read_frames, args=(camera,), daemon=True)
+        self.retry = Event()
+        self.retry.set()
+        self.reader = Thread(target=self.run, args=(index,), daemon=True)
         self.reader.start()
 
-    def read_frames(self, camera):
+    def connect(self):
+        if self.state == "offline":
+            self.state = "checking"
+            self.retry.set()
+
+    def run(self, index):
         while not self.finished.is_set():
+            self.retry.wait()
+            self.retry.clear()
+            if self.finished.is_set():
+                break
+            camera = None
+            try:
+                backend = cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY
+                camera = cv2.VideoCapture(index, backend)
+                if camera.isOpened():
+                    if sys.platform.startswith("linux"):
+                        # Prefer the C270's uncompressed mode for a clean 720p preview.
+                        camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
+                    camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                    self.read_frames(camera)
+            except (cv2.error, OSError) as error:
+                print(f"Camera: {error}", file=sys.stderr)
+            finally:
+                if camera is not None:
+                    camera.release()
+                self.latest = None
+                self.state = "offline"
+
+    def read_frames(self, camera):
+        misses = 0
+        while not self.finished.is_set() and misses < 5:
             try:
                 ok, photo = camera.read()
             except cv2.error:
                 ok = False
             self.latest = photo if ok else None
+            if ok:
+                self.state = "ready"
+            misses = 0 if ok else misses + 1
             self.finished.wait(0.01 if ok else 0.2)
 
     def close(self):
         self.finished.set()
+        self.retry.set()
         self.reader.join()
+
+
+@dataclass
+class Retake:
+    index: int
+    original: ndarray
+    from_review: bool
+    show_original: bool = True
 
 
 class Studio:
@@ -223,6 +277,8 @@ class Studio:
         self.fades = project_fades(folder, frames)
         self.messages = project_messages(folder)
         self.drawings = project_drawings(folder)
+        self.holds = project_holds(folder)
+        self.clean_background, self.supports = project_support(folder)
         stored_frames = frames + project_frames(folder / REMOVED_DIR)
         self.numbered_frames = any(not photo.stem.startswith("frame_") for photo in stored_frames)
         self.next_frame_number = max(map(frame_number, stored_frames), default=0) + 1
@@ -231,9 +287,13 @@ class Studio:
         self.choose_project = choose_project
         self.next_project = None
         self.live_photo = None
+        self.camera_state = "checking"
+        self.first_camera_check = True
+        self.camera_connect_requested = False
         self.last_photo = read_photo(frames[-1]) if frames else None
         self.review_index = None
         self.review_photo = None
+        self.cleaned_photo = None
         self.drawn_photo = None
         self.review_display = None
         self.blended_photo = None
@@ -248,7 +308,7 @@ class Studio:
         self.join_dialog = None
         self.narration_dialog = None
         self.ghost = False
-        self.retake = False
+        self.retake = None
         self.confirming_removal = False
         self.removed_photo = None
         self.tools_panel = None
@@ -344,6 +404,7 @@ class Studio:
             ),
             (
                 ("capture", "Take Photo", "Space", "space", "primary"),
+                ("connect", "Connect Camera", "K", "k", "normal"),
                 ("overlay", "Show Last Photo", "O", "o", "normal"),
                 ("replay", "Replay Last 6", "L", "l", "normal"),
                 ("review", "Review Photos", "←", "left", "normal"),
@@ -363,13 +424,17 @@ class Studio:
                 ("keep_photo", "Keep Photo", "Esc", "escape", "primary"),
                 ("confirm_remove", "Remove Photo", "Enter", "return", "remove"),
                 ("save_retake", "Use New Photo", "Space", "space", "primary"),
-                ("cancel_retake", "Keep Last Photo", "Esc", "escape", "normal"),
+                ("cancel_retake", "Keep Original Photo", "Esc", "escape", "normal"),
             ), (
                 ("retake", "Retake Last", "R", "r", "normal"),
+                ("retake_selected", "Retake This Photo", "R", "r", "normal"),
+                ("background", "Take Clean Background", "G", "g", "normal"),
                 ("fade", "Fade to Next Photo", "F", "f", "normal"),
                 ("duplicate", "Duplicate Photo", "D", "d", "normal"),
+                ("hold", "Hold This Photo", "H", "h", "normal"),
                 ("message", "Add Message", "T", "t", "normal"),
                 ("draw", "Draw on Photo", "B", "b", "normal"),
+                ("support", "Hide the Support", "U", "u", "normal"),
                 ("earlier", "Move Earlier", "Shift+Left", "shift-left", "normal"),
                 ("later", "Move Later", "Shift+Right", "shift-right", "normal"),
                 ("remove", "Remove Photo", "Delete", "delete", "normal"),
@@ -402,14 +467,19 @@ class Studio:
     def update_controls(self):
         count = len(self.frames)
         fade_frames = sum(fade_frame_count(seconds, self.fps) for seconds in self.fades.values())
-        still_frames = sum(hold_frames(self.messages.get(photo.name), self.fps) for photo in self.frames)
+        still_frames = sum(hold_frame_count(self.holds.get(photo.name, 0), self.messages.get(photo.name), self.fps)
+                           for photo in self.frames)
         self.count.configure(text=f"{count} photos  ·  {(still_frames + fade_frames) / self.fps:.1f} sec")
         set_button_label(self.buttons["speed"], f"Speed · {self.fps} fps")
         if self.confirming_removal:
             self.heading.configure(text=f"Remove photo {self.review_index + 1}?")
             self.show_actions(("keep_photo", "confirm_remove"))
             return
-        set_button_label(self.buttons["overlay"], "Hide Last Photo" if self.ghost else "Show Last Photo")
+        if self.retake:
+            overlay = "Hide Original Photo" if self.retake.show_original else "Show Original Photo"
+        else:
+            overlay = "Hide Last Photo" if self.ghost else "Show Last Photo"
+        set_button_label(self.buttons["overlay"], overlay)
         set_button_label(self.buttons["camera_tools"], "Hide Camera Tools" if self.tools_panel == "camera" else "Camera Tools")
         set_button_label(self.buttons["edit"], "Hide Edit Tools" if self.tools_panel == "edit" else "Edit Photo")
         can_edit = self.export_job is None and self.duplicate_job is None
@@ -433,27 +503,40 @@ class Studio:
             self.set_button_state("fade", not at_end and can_edit)
             self.set_button_state("earlier", self.review_index > 0 and can_edit)
             self.set_button_state("later", not at_end and can_edit)
-            has_message = self.frames[self.review_index].name in self.messages
+            name = self.frames[self.review_index].name
+            has_message = name in self.messages
             set_button_label(self.buttons["message"], "Edit Message" if has_message else "Add Message")
-            for action in ("duplicate", "message", "draw", "remove"):
+            hold = self.holds.get(name)
+            set_button_label(self.buttons["hold"], f"Hold · {hold:g} sec" if hold else "Hold This Photo")
+            self.set_button_state("retake_selected", can_edit and self.live_photo is not None)
+            for action in ("hold", "duplicate", "message", "draw", "support", "remove"):
                 self.set_button_state(action, can_edit)
-            edits = ("earlier", "later", "duplicate", "message", "draw", "fade", "remove") if self.tools_panel == "edit" else ()
+            edits = ()
+            if self.tools_panel == "edit":
+                edits = ("retake_selected", "earlier", "later", "hold", "duplicate",
+                         "message", "draw", "support", "fade", "remove")
             self.show_actions(
                 ("camera", "previous", "next", "play_here", "edit", "finish"),
                 (*undo, *edits),
             )
         elif self.retake:
-            self.heading.configure(text=f"Retake photo {count}")
-            self.set_button_state("save_retake", self.export_job is None)
+            self.heading.configure(text=f"Retake photo {self.retake.index + 1}")
+            self.set_button_state("save_retake", can_edit and self.live_photo is not None)
             self.show_actions(("save_retake", "cancel_retake", "overlay"))
         else:
-            title = "Live camera · Last photo showing" if self.ghost and self.last_photo is not None else "Live camera"
+            title = {"offline": "Camera disconnected", "checking": "Connecting camera"}.get(self.camera_state, "Live camera")
+            if self.live_photo is not None and self.ghost and self.last_photo is not None:
+                title = "Live camera · Last photo showing"
             self.heading.configure(text=title)
-            for action in ("review", "play", "replay", "retake"):
+            for action in ("review", "play", "replay"):
                 self.set_button_state(action, count > 0)
-            self.set_button_state("capture", self.export_job is None)
-            camera_tools = ("retake",) if self.tools_panel == "camera" else ()
-            self.show_actions(("capture", "overlay", "replay", "review", "play", "camera_tools", "finish"),
+            capture_ready = self.live_photo is not None and can_edit
+            self.set_button_state("capture", capture_ready)
+            self.set_button_state("retake", count > 0 and capture_ready)
+            self.set_button_state("background", capture_ready)
+            camera_tools = ("retake", "background") if self.tools_panel == "camera" else ()
+            shooting = ("connect",) if self.camera_state == "offline" else ("capture", "overlay")
+            self.show_actions((*shooting, "replay", "review", "play", "camera_tools", "finish"),
                               (*undo, *camera_tools))
 
     def set_button_state(self, name, enabled):
@@ -474,9 +557,11 @@ class Studio:
             photo = self.review_display if self.blended_photo is None else self.blended_photo
         else:
             photo = self.live_photo
-            if self.ghost and photo is not None and self.last_photo is not None:
-                if photo.shape == self.last_photo.shape:
-                    photo = cv2.addWeighted(photo, 0.65, self.last_photo, 0.35, 0)
+            overlay = self.retake.original if self.retake and self.retake.show_original else None
+            if self.retake is None and self.ghost:
+                overlay = self.last_photo
+            if photo is not None and overlay is not None and photo.shape == overlay.shape:
+                photo = cv2.addWeighted(photo, 0.65, overlay, 0.35, 0)
         width = self.viewport.winfo_width()
         height = self.viewport.winfo_height()
         if photo is not None and min(width, height) > 1:
@@ -526,8 +611,9 @@ class Studio:
         count = len(self.frames)
         last_page = max(0, count - self.RECENT_COUNT)
         start = last_page if self.strip_offset is None else min(self.strip_offset, last_page)
-        if self.review_index is not None:
-            start = max(self.review_index - self.RECENT_COUNT + 1, min(start, self.review_index))
+        selected_index = self.retake.index if self.retake else self.review_index
+        if selected_index is not None:
+            start = max(selected_index - self.RECENT_COUNT + 1, min(start, selected_index))
             self.strip_offset = start
         if last_page:
             if not self.strip_scroll.winfo_manager():
@@ -556,12 +642,13 @@ class Studio:
                 break
             name = self.frames[index].name
             markers = [letter for letter, enabled in (
-                ("T", name in self.messages), ("B", name in self.drawings), ("F", self.fade_after(index)),
+                ("T", name in self.messages), ("B", name in self.drawings),
+                ("H", name in self.holds), ("U", name in self.supports), ("F", self.fade_after(index)),
             ) if enabled]
             caption = str(index + 1) + ("  ·  " + " ".join(markers) if markers else "")
             if caption != number.cget("text"):
                 number.configure(text=caption)
-            selected = index == self.review_index
+            selected = index == selected_index
             tile.configure(bg=self.accent if selected else self.panel)
             number.configure(fg=self.accent if selected else self.muted)
 
@@ -595,53 +682,131 @@ class Studio:
 
     def refresh_camera(self):
         photo = self.feed.latest
+        frame_changed = photo is not self.live_photo
+        readiness_changed = (photo is None) != (self.live_photo is None)
+        self.live_photo = photo
+        if self.feed.state != self.camera_state:
+            self.camera_state = self.feed.state
+            if self.first_camera_check and self.camera_state != "checking":
+                self.first_camera_check = False
+                if self.camera_state == "offline" and self.review_index is None and self.tools_panel is None and self.frames:
+                    self.select_photo(len(self.frames) - 1)
+                    self.tell("Editing without a camera. Connect one when you want to shoot.")
+            if self.camera_state == "offline" and self.retake:
+                self.cancel_retake()
+                self.tell("Camera disconnected. Your original photo is still saved.")
+            elif self.camera_connect_requested and self.camera_state != "checking":
+                self.camera_connect_requested = False
+                if self.review_index is not None and self.camera_state == "ready":
+                    self.tell("Camera ready. Choose Back to Camera to take photos.")
+                else:
+                    self.tell(self.camera_hint())
+            elif self.review_index is None and self.tools_panel is None:
+                self.tell(self.camera_hint())
+            self.update_controls()
+        elif readiness_changed:
+            self.update_controls()
         if self.review_index is None and self.resize_job is None:
             if photo is None:
                 self.show_camera_error()
-            elif photo is not self.live_photo:
-                self.live_photo = photo
+            elif frame_changed:
                 self.update_picture()
-        self.live_photo = photo
         self.camera_job = self.root.after(25, self.refresh_camera)
 
     def show_camera_error(self):
-        self.picture.configure(image="", text="Waiting for camera. Check the USB connection.")
+        message = ("Plug in the USB webcam, then choose Connect Camera." if self.camera_state == "offline"
+                   else "Waiting for a live camera picture...")
+        if self.picture.cget("text") != message:
+            self.picture.configure(image="", text=message)
+
+    def connect_camera(self):
+        if self.camera_state == "offline":
+            self.camera_connect_requested = True
+            self.feed.connect()
+            self.camera_state = "checking"
+            self.update_controls()
+            self.tell("Looking for the camera...")
+
+    def camera_hint(self):
+        if self.camera_state == "offline":
+            return "Choose Review Photos to edit, or Connect Camera to try again."
+        if self.live_photo is None:
+            return "Waiting for a live camera picture..."
+        return "Move your subject a little, then press Space."
 
     def capture(self):
         if self.export_job is not None:
             self.tell("Saving the movie. You can take more photos when it finishes.")
             return
         if self.live_photo is None:
-            self.tell("Wait for the live camera image before taking a photo.")
+            self.tell("Connect a camera and wait for the live picture to take photos.")
             return
         if not self.numbered_frames and self.last_photo is not None and self.last_photo.shape != self.live_photo.shape:
             self.tell("Camera size changed. Restore the original camera or start a new project.")
             return
-        if self.retake:
-            path = self.frames[-1]
+        retake = self.retake
+        if retake:
+            path = self.frames[retake.index]
+            if path.name in self.supports and self.live_photo.shape != retake.original.shape:
+                self.tell("Use the original photo size to keep its support cleanup aligned.")
+                return
         else:
             name = f"{self.next_frame_number:03d}.png" if self.numbered_frames else f"frame_{self.next_frame_number:06d}.png"
             path = self.folder / name
         try:
-            save_photo(path, self.live_photo, replace=self.retake)
+            save_photo(path, self.live_photo, replace=retake is not None)
         except (ValueError, OSError, cv2.error) as error:
             self.tell("Could not save the photo. Check free space and folder permissions.")
             print(error, file=sys.stderr)
             return
-        if self.retake:
+        if retake:
             self.thumbnail.cache_clear()
+            if retake.index == len(self.frames) - 1:
+                self.last_photo = self.live_photo
         else:
             self.frames.append(path)
             self.next_frame_number += 1
             self.removed_photo = None
+            self.last_photo = self.live_photo
         self.cut_revision += 1
-        self.last_photo = self.live_photo
-        self.retake = False
+        self.retake = None
         self.strip_start = None
         self.strip_offset = None
+        if retake and retake.from_review:
+            self.select_photo(retake.index)
+            self.tell(f"Photo {retake.index + 1} replaced.")
+            return
         self.update_strip()
         self.update_controls()
+        self.update_picture()
         self.tell(f"Photo {len(self.frames)} saved. Move a little, then press Space.")
+
+    def capture_clean_background(self):
+        if self.review_index is not None or self.retake:
+            self.tell("Go back to Camera to take a clean background.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the movie to finish saving.")
+            return
+        if self.live_photo is None:
+            self.tell("Wait for the live camera image before taking a clean background.")
+            return
+        name = f"background-{uuid4().hex}.png"
+        path = self.folder / CLEAN_BACKGROUNDS / name
+        try:
+            path.parent.mkdir(exist_ok=True)
+            save_photo(path, self.live_photo)
+            try:
+                save_support(self.folder, name, self.supports)
+            except OSError:
+                path.unlink(missing_ok=True)
+                raise
+        except (OSError, ValueError, cv2.error) as error:
+            self.tell("Could not save the clean background. Check space and folder permissions.")
+            print(error, file=sys.stderr)
+            return
+        self.clean_background = name
+        self.tell("Clean background saved. Add your LEGO figure and start shooting.")
 
     def stop_playback(self):
         if self.play_job is not None:
@@ -656,15 +821,17 @@ class Studio:
         try:
             path = self.frames[index]
             photo = self.last_photo if index == len(self.frames) - 1 else read_photo(path)
-            drawn = draw_strokes(photo, self.drawings.get(path.name))
+            cleaned = hide_support(photo, self.folder, self.supports.get(path.name))
+            drawn = draw_strokes(cleaned, self.drawings.get(path.name))
             display = draw_message(drawn, self.messages.get(path.name))
         except ValueError as error:
             self.stop_playback()
             self.update_controls()
             self.tell(str(error))
             return False
-        self.retake = False
+        self.retake = None
         self.review_photo = photo
+        self.cleaned_photo = cleaned
         self.drawn_photo = drawn
         self.review_display = display
         self.review_index = index
@@ -687,10 +854,13 @@ class Studio:
             self.tools_panel = None
         if self.show_photo(index):
             seconds = self.fade_after(self.review_index)
-            if seconds:
+            hold = self.holds.get(self.frames[index].name)
+            if hold:
+                self.tell(f"Hold set to {hold:g} sec. Press H to change it.")
+            elif seconds:
                 self.tell(f"{seconds:g} sec fade to the next photo. Press F to change it.")
             else:
-                self.tell("Use the arrow keys to compare photos. Press F to fade to the next photo.")
+                self.tell("Use the arrows to compare photos. H holds a photo. F adds a fade.")
 
     def move_review_photo(self, offset):
         index = self.review_index
@@ -834,7 +1004,7 @@ class Studio:
         self.update_controls()
         name = self.frames[index].name
         original = self.drawings.get(name, ())
-        dialog = DrawingDialog(self.root, self.review_photo, original, self.messages.get(name), self.photo_image)
+        dialog = DrawingDialog(self.root, self.cleaned_photo, original, self.messages.get(name), self.photo_image)
         strokes = dialog.result
         if strokes is None or strokes == original:
             return
@@ -853,6 +1023,91 @@ class Studio:
         self.cut_revision += 1
         if self.show_photo(index):
             self.tell("Drawing saved." if strokes else "Drawing removed.")
+
+    def edit_support(self):
+        from drawing_dialog import SupportDialog
+
+        index = self.review_index
+        if index is None:
+            self.tell("Use Review Photos to pick the photo with the support.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the movie to finish saving before editing the photo.")
+            return
+        if self.clean_background is None:
+            self.tell("In Camera Tools, take a clean background before hiding a support.")
+            return
+        self.stop_playback()
+        self.resume_mode = "all"
+        self.update_controls()
+        name = self.frames[index].name
+        original = self.supports.get(name, SupportEdit(self.clean_background, ()))
+        try:
+            background = read_clean_background(self.folder / CLEAN_BACKGROUNDS / original.background)
+        except ValueError as error:
+            self.tell(str(error))
+            return
+        if self.review_photo.shape != background.shape:
+            self.tell("Use a clean background taken at the same image size as this photo.")
+            return
+        dialog = SupportDialog(
+            self.root, self.review_photo, background, original.strokes, self.drawings.get(name),
+            self.messages.get(name), self.photo_image,
+        )
+        if dialog.result is None or dialog.result == original.strokes:
+            return
+        supports = self.supports.copy()
+        if dialog.result:
+            supports[name] = SupportEdit(original.background, dialog.result)
+        else:
+            supports.pop(name, None)
+        try:
+            save_support(self.folder, self.clean_background, supports)
+        except OSError as error:
+            self.tell("Could not save the cleanup. Check the project folder permissions.")
+            print(error, file=sys.stderr)
+            return
+        self.supports = supports
+        self.cut_revision += 1
+        if self.show_photo(index):
+            self.tell("Cleanup saved." if dialog.result else "Cleanup cleared.")
+
+    def edit_hold(self):
+        index = self.review_index
+        if index is None:
+            self.tell("Use Review Photos to choose a photo to hold.")
+            return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before changing a hold.")
+            return
+        self.stop_playback()
+        self.resume_mode = "all"
+        self.update_controls()
+        name = self.frames[index].name
+        current = self.holds.get(name, 0)
+        message = self.messages.get(name)
+        seconds = choose_photo_hold(self.tk, self.root, index + 1, current, message)
+        if seconds is None or seconds == current:
+            return
+        holds = self.holds.copy()
+        if seconds:
+            holds[name] = seconds
+        else:
+            holds.pop(name, None)
+        try:
+            save_holds(self.folder, holds)
+        except OSError as error:
+            self.tell("Could not save the hold. Check that the project folder can be written to.")
+            print(error, file=sys.stderr)
+            return
+        self.holds = holds
+        self.cut_revision += 1
+        self.update_controls()
+        self.update_strip()
+        if message is not None and message.seconds > seconds:
+            self.tell(f"The message still shows for {message.seconds:g} sec.")
+        else:
+            self.tell(f"Hold set to {seconds:g} sec." if seconds else "Hold cleared.")
 
     def fade_after(self, index):
         if index + 1 < len(self.frames):
@@ -932,8 +1187,8 @@ class Studio:
                 return
         if self.show_photo(index):
             rate = min(self.fps, 6) if self.play_mode == "recent" else self.fps
-            message = self.messages.get(self.frames[index].name)
-            next_due = due + hold_frames(message, rate) / rate
+            name = self.frames[index].name
+            next_due = due + hold_frame_count(self.holds.get(name, 0), self.messages.get(name), rate) / rate
             count = fade_frame_count(self.fade_after(index), rate)
             if not count:
                 self.queue_playback(next_due, self.play_frame, index + 1, first, next_due)
@@ -941,7 +1196,7 @@ class Studio:
             try:
                 height, width = read_photo(self.frames[0]).shape[:2]
                 before = fit_movie_frame(self.drawn_photo, width, height)
-                after = fit_movie_frame(read_drawn_photo(self.frames[index + 1], self.drawings), width, height)
+                after = fit_movie_frame(read_edited_photo(self.frames[index + 1], self.drawings, self.supports), width, height)
             except (ValueError, cv2.error) as error:
                 self.stop_playback()
                 self.update_controls()
@@ -967,9 +1222,10 @@ class Studio:
         self.stop_playback()
         self.review_index = None
         self.review_photo = None
+        self.cleaned_photo = None
         self.drawn_photo = None
         self.review_display = None
-        self.retake = False
+        self.retake = None
         self.tools_panel = None
         self.strip_offset = None
         self.update_controls()
@@ -978,16 +1234,34 @@ class Studio:
             self.show_camera_error()
         else:
             self.update_picture()
-        self.tell("Move your subject a little, then press Space.")
+        self.tell(self.camera_hint())
 
     def start_retake(self):
         if not self.frames:
             self.tell("Take a photo before you try to retake one.")
             return
+        if self.export_job is not None:
+            self.tell("Wait for the MP4 to finish saving before retaking a photo.")
+            return
+        if self.live_photo is None:
+            self.tell("Connect a camera to retake a photo.")
+            return
+        from_review = self.review_index is not None
+        index = self.review_index if from_review else len(self.frames) - 1
+        original = self.review_photo if from_review else self.last_photo
         self.back_to_camera()
-        self.retake = True
+        self.retake = Retake(index, original, from_review)
         self.update_controls()
-        self.tell("Set up the shot again. Space replaces the last photo. Esc keeps it.")
+        self.update_strip()
+        self.update_picture()
+        self.tell("Line up the shot. Press Space to replace it or Esc to keep the original.")
+
+    def cancel_retake(self):
+        retake = self.retake
+        self.back_to_camera()
+        if retake.from_review:
+            self.select_photo(retake.index)
+        self.tell("Original photo kept.")
 
     def ask_remove_photo(self):
         if self.review_index is None:
@@ -1064,7 +1338,7 @@ class Studio:
     def open_finish(self):
         if self.tools_panel != "finish":
             self.stop_playback()
-            self.retake = False
+            self.retake = None
             self.tools_panel = "finish"
             self.update_controls()
             if self.export_job is not None:
@@ -1192,6 +1466,8 @@ class Studio:
                 self.update_controls()
                 self.tell("Photo kept.")
             return
+        if self.retake and key not in ("space", "o", "escape", "ctrl-o", "q"):
+            return
         if self.tools_panel == "finish":
             if key in ("escape", "m"):
                 self.leave_finish()
@@ -1210,10 +1486,15 @@ class Studio:
                 start = None if self.review_index == len(self.frames) - 1 else self.review_index
                 self.play(self.resume_mode, start)
         elif key == "o" and self.review_index is None:
-            self.ghost = not self.ghost
+            if self.retake:
+                self.retake.show_original = not self.retake.show_original
+            else:
+                self.ghost = not self.ghost
             self.update_controls()
             self.update_picture()
-            if not self.ghost:
+            if self.retake:
+                self.tell("Original photo showing." if self.retake.show_original else "Original photo hidden.")
+            elif not self.ghost:
                 self.tell("Last photo hidden.")
             elif not self.frames:
                 self.tell("Your last photo will appear here after you take one.")
@@ -1231,10 +1512,18 @@ class Studio:
             self.undo_remove()
         elif key == "d":
             self.duplicate_review_photo()
+        elif key == "h":
+            self.edit_hold()
         elif key == "t":
             self.edit_message()
         elif key == "b":
             self.edit_drawing()
+        elif key == "g":
+            self.capture_clean_background()
+        elif key == "k":
+            self.connect_camera()
+        elif key == "u":
+            self.edit_support()
         elif key == "f":
             self.edit_fade()
         elif key in ("p", "l"):
@@ -1264,7 +1553,9 @@ class Studio:
         elif key == "ctrl-o":
             self.switch_movie()
         elif key == "escape":
-            if self.tools_panel is not None:
+            if self.retake:
+                self.cancel_retake()
+            elif self.tools_panel is not None:
                 self.tools_panel = None
                 self.update_controls()
             else:
@@ -1328,27 +1619,16 @@ class Studio:
 def run_studio(root, tk, folder, camera_index, fps, choose_project=None):
     folder.mkdir(parents=True, exist_ok=True)
     frames = project_frames(folder)
-    camera = cv2.VideoCapture(camera_index, cv2.CAP_V4L2 if sys.platform.startswith("linux") else cv2.CAP_ANY)
+    print(f"Project: {folder}")
+    feed = CameraFeed(camera_index)
     try:
-        if not camera.isOpened():
-            raise ValueError("Cannot open webcam. Close other camera apps or try --camera 1.")
-        if sys.platform.startswith("linux"):
-            # Prefer the C270's uncompressed mode for a clean 720p preview.
-            camera.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        print(f"Project: {folder}")
-        feed = CameraFeed(camera)
-        try:
-            with ThreadPoolExecutor(max_workers=1) as exporter:
-                studio = Studio(root, tk, feed, folder, frames, fps, exporter, choose_project)
-                studio.set_fullscreen(True)
-                root.mainloop()
-                return studio.next_project
-        finally:
-            feed.close()
+        with ThreadPoolExecutor(max_workers=1) as exporter:
+            studio = Studio(root, tk, feed, folder, frames, fps, exporter, choose_project)
+            studio.set_fullscreen(True)
+            root.mainloop()
+            return studio.next_project
     finally:
-        camera.release()
+        feed.close()
 
 
 def main():

@@ -117,6 +117,63 @@ def choose_movie_speed(tk, parent, current):
     return SpeedDialog(parent, title="Movie Speed").result
 
 
+def choose_photo_hold(tk, parent, number, current, message):
+    from tkinter import simpledialog
+
+    from photo_holds import MAX_HOLD_SECONDS, MIN_HOLD_SECONDS, valid_hold
+
+    class HoldDialog(simpledialog.Dialog):
+        background = "#202a39"
+
+        def body(self, panel):
+            self.configure(bg=self.background)
+            panel.configure(bg=self.background, padx=12, pady=8)
+            tk.Label(panel, text=f"How long should photo {number} stay on screen?",
+                     bg=self.background, fg="#f4f7fc", font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+            timing = tk.Frame(panel, bg=self.background)
+            timing.pack(fill="x", pady=(8, 4))
+            self.seconds = tk.StringVar(master=self, value=f"{current or 2:g}")
+            box = tk.Spinbox(timing, from_=MIN_HOLD_SECONDS, to=MAX_HOLD_SECONDS, increment=.1, width=7,
+                             textvariable=self.seconds, font=("TkDefaultFont", 13))
+            box.pack(side="left", padx=(0, 6))
+            box.selection_range(0, "end")
+            tk.Label(timing, text="seconds", bg=self.background, fg="#f4f7fc").pack(side="left")
+            if message is not None:
+                tk.Label(panel, text=f"This message stays visible for at least {message.seconds:g} sec.",
+                         bg=self.background, fg="#bdcbe0").pack(anchor="w")
+            self.status = tk.Label(panel, bg=self.background, fg="#f4f7fc", anchor="w")
+            self.status.pack(fill="x")
+            return box
+
+        def buttonbox(self):
+            buttons = tk.Frame(self, bg=self.background)
+            buttons.pack(fill="x", padx=17, pady=(0, 11))
+            shortcut_button(tk, buttons, "Save Hold", "Enter", self.ok, tone="primary").pack(side="left")
+            if current:
+                shortcut_button(tk, buttons, "Clear Hold", None, self.clear).pack(side="left", padx=6)
+            shortcut_button(tk, buttons, "Cancel", "Esc", self.cancel).pack(side="right")
+            self.bind("<Return>", self.ok)
+            self.bind("<KP_Enter>", self.ok)
+            self.bind("<Escape>", self.cancel)
+
+        def validate(self):
+            try:
+                seconds = float(self.seconds.get())
+            except ValueError:
+                seconds = 0
+            if not valid_hold(seconds):
+                self.status.configure(text=f"Enter a time from {MIN_HOLD_SECONDS:g} to {MAX_HOLD_SECONDS} seconds.")
+                return False
+            self.result = seconds
+            return True
+
+        def clear(self):
+            self.result = 0
+            self.cancel()
+
+    return HoldDialog(parent, title="Hold This Photo").result
+
+
 class ButtonRow:
     def __init__(self, tk, parent, background):
         self.frame = tk.Frame(parent, bg=background, height=1)

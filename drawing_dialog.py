@@ -7,28 +7,38 @@ import cv2
 
 from photo_drawings import MAX_POINTS, MAX_STROKES, THICKNESS, Stroke, draw_strokes
 from photo_messages import PALETTE, draw_message
+from photo_support import HIDE, RESTORE, paint_mask, reveal_background, support_mask
 from ui_controls import shortcut_button
 
 
 class DrawingDialog(simpledialog.Dialog):
     background = "#202a39"
     foreground = "#f4f7fc"
+    window_title = "Draw on Photo"
+    default_color = PALETTE["Yellow"]
+    save_label = "Save Drawing"
+    clear_label = "Clear Drawing"
+    instructions = "Drag on the picture to draw."
+    cleared_status = "Drawing cleared in the preview. Save to keep this change."
 
     def __init__(self, parent, photo, strokes, message, photo_image):
         height, width = photo.shape[:2]
         limits = (min(850, parent.winfo_screenwidth() - 50), min(510, parent.winfo_screenheight() - 225))
         scale = min(1, limits[0] / width, limits[1] / height)
         self.width, self.height = max(1, int(width * scale)), max(1, int(height * scale))
-        self.photo = cv2.resize(photo, (self.width, self.height), interpolation=cv2.INTER_AREA)
+        self.photo = self.resize_preview(photo)
         self.strokes = strokes
         self.message = message
         self.photo_image = photo_image
         self.history = []
         self.points = None
-        self.color = strokes[-1].color if strokes else PALETTE["Yellow"]
+        self.color = strokes[-1].color if strokes else self.default_color
         self.thickness = strokes[-1].thickness if strokes else "Medium"
         self.redraw_job = None
-        super().__init__(parent, title="Draw on Photo")
+        super().__init__(parent, title=self.window_title)
+
+    def resize_preview(self, photo):
+        return cv2.resize(photo, (self.width, self.height), interpolation=cv2.INTER_AREA)
 
     def label(self, parent, text="", **options):
         return tk.Label(parent, text=text, bg=self.background, fg=self.foreground, **options)
@@ -40,18 +50,7 @@ class DrawingDialog(simpledialog.Dialog):
 
         controls = tk.Frame(panel, bg=self.background)
         controls.pack(fill="x")
-        self.color_label = self.label(controls, width=15, anchor="w")
-        self.color_label.grid(row=0, column=0, sticky="w")
-        swatches = tk.Frame(controls, bg=self.background)
-        swatches.grid(row=0, column=1, sticky="w")
-        self.swatches = {}
-        for color in PALETTE.values():
-            button = tk.Button(
-                swatches, width=2, bg=color, activebackground=color,
-                command=lambda color=color: self.set_color(color),
-            )
-            button.pack(side="left", padx=(0, 4))
-            self.swatches[color] = button
+        self.build_brush_picker(controls)
 
         self.label(controls, "Thickness").grid(row=1, column=0, sticky="w")
         widths = tk.Frame(controls, bg=self.background)
@@ -78,21 +77,35 @@ class DrawingDialog(simpledialog.Dialog):
         self.canvas.bind("<ButtonPress-1>", self.start_stroke)
         self.canvas.bind("<B1-Motion>", self.extend_stroke)
         self.canvas.bind("<ButtonRelease-1>", self.finish_stroke)
-        self.status = self.label(panel, "Drag on the picture to draw.", anchor="w")
+        self.status = self.label(panel, self.instructions, anchor="w")
         self.status.pack(fill="x", pady=(4, 0))
         self.set_color(self.color)
         self.set_thickness(self.thickness)
-        self.ink_preview = draw_strokes(self.photo, self.strokes)
+        self.rebuild_preview()
         self.redraw()
         return self.canvas
+
+    def build_brush_picker(self, controls):
+        self.color_label = self.label(controls, width=15, anchor="w")
+        self.color_label.grid(row=0, column=0, sticky="w")
+        swatches = tk.Frame(controls, bg=self.background)
+        swatches.grid(row=0, column=1, sticky="w")
+        self.swatches = {}
+        for color in PALETTE.values():
+            button = tk.Button(
+                swatches, width=2, bg=color, activebackground=color,
+                command=lambda color=color: self.set_color(color),
+            )
+            button.pack(side="left", padx=(0, 4))
+            self.swatches[color] = button
 
     def buttonbox(self):
         box = tk.Frame(self, bg=self.background, padx=12, pady=6)
         box.pack(fill="x")
-        shortcut_button(tk, box, "Save Drawing", "Enter", self.ok, tone="primary").pack(side="left")
+        shortcut_button(tk, box, self.save_label, "Enter", self.ok, tone="primary").pack(side="left")
         self.undo_button = shortcut_button(tk, box, "Undo", "Ctrl+Z", self.undo)
         self.undo_button.pack(side="left", padx=6)
-        self.clear_button = shortcut_button(tk, box, "Clear Drawing", None, self.clear, tone="remove")
+        self.clear_button = shortcut_button(tk, box, self.clear_label, None, self.clear, tone="remove")
         self.clear_button.pack(side="left")
         shortcut_button(tk, box, "Cancel", "Esc", self.cancel).pack(side="right")
         self.bind("<Return>", self.ok)
@@ -119,7 +132,7 @@ class DrawingDialog(simpledialog.Dialog):
 
     def start_stroke(self, event):
         if len(self.strokes) >= MAX_STROKES:
-            self.status.configure(text="Drawing is full. Undo a stroke or clear it to keep drawing.")
+            self.status.configure(text="This edit is full. Undo a stroke or clear it to keep brushing.")
             return
         self.canvas.focus_set()
         self.points = [self.point(event)]
@@ -149,12 +162,16 @@ class DrawingDialog(simpledialog.Dialog):
 
     def redraw(self):
         self.redraw_job = None
-        preview = self.ink_preview
-        if self.points is not None:
-            preview = draw_strokes(preview, (self.active_stroke(),))
-        preview = draw_message(preview, self.message)
+        active = self.active_stroke() if self.points is not None else None
+        preview = draw_message(self.brush_preview(active), self.message)
         self.canvas.image = self.photo_image(preview, self.width, self.height)
         self.canvas.itemconfigure(self.canvas_photo, image=self.canvas.image)
+
+    def rebuild_preview(self):
+        self.ink_preview = draw_strokes(self.photo, self.strokes)
+
+    def brush_preview(self, active):
+        return draw_strokes(self.ink_preview, (active,)) if active is not None else self.ink_preview
 
     def change_strokes(self, strokes):
         self.history.append(self.strokes)
@@ -177,13 +194,13 @@ class DrawingDialog(simpledialog.Dialog):
     def clear(self):
         if self.strokes:
             self.change_strokes(())
-            self.status.configure(text="Drawing cleared in the preview. Save to keep this change.")
+            self.status.configure(text=self.cleared_status)
 
     def refresh_drawing(self):
-        self.ink_preview = draw_strokes(self.photo, self.strokes)
+        self.rebuild_preview()
         self.queue_redraw()
         self.update_buttons()
-        self.status.configure(text="Drag on the picture to draw.")
+        self.status.configure(text=self.instructions)
 
     def update_buttons(self):
         self.undo_button.configure(state="normal" if self.history else "disabled")
@@ -197,3 +214,43 @@ class DrawingDialog(simpledialog.Dialog):
             self.after_cancel(self.redraw_job)
             self.redraw_job = None
         super().destroy()
+
+
+class SupportDialog(DrawingDialog):
+    window_title = "Hide the Support"
+    default_color = HIDE
+    save_label = "Save Cleanup"
+    clear_label = "Clear Cleanup"
+    instructions = "Brush over the support. Bring Back restores spots you brushed by mistake."
+    cleared_status = "Cleanup cleared in the preview. Save to keep this change."
+
+    def __init__(self, parent, photo, background, strokes, drawings, message, photo_image):
+        self.clean_photo = background
+        self.drawings = drawings
+        super().__init__(parent, photo, strokes, message, photo_image)
+
+    def build_brush_picker(self, controls):
+        self.clean_preview = self.resize_preview(self.clean_photo)
+        self.label(controls, "Brush").grid(row=0, column=0, sticky="w")
+        tools = tk.Frame(controls, bg=self.background)
+        tools.grid(row=0, column=1, sticky="w")
+        self.swatches = {}
+        for color, label in ((HIDE, "Hide Support"), (RESTORE, "Bring Back")):
+            button = tk.Button(tools, text=label, command=lambda color=color: self.set_color(color))
+            button.pack(side="left", padx=(0, 5))
+            self.swatches[color] = button
+
+    def set_color(self, color):
+        self.color = color
+        for value, button in self.swatches.items():
+            button.configure(relief="sunken" if color == value else "raised")
+
+    def rebuild_preview(self):
+        self.mask = support_mask(self.photo.shape[:2], self.strokes)
+
+    def brush_preview(self, active):
+        mask = self.mask
+        if active is not None:
+            mask = mask.copy()
+            paint_mask(mask, active)
+        return draw_strokes(reveal_background(self.photo, self.clean_preview, mask), self.drawings)

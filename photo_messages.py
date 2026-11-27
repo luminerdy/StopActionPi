@@ -77,10 +77,6 @@ def save_messages(folder, messages):
             temporary.unlink(missing_ok=True)
 
 
-def hold_frames(message, fps):
-    return message.seconds * fps if message else 1
-
-
 def luminance(color):
     channels = [int(color[i:i + 2], 16) / 255 for i in (1, 3, 5)]
     linear = [v / 12.92 if v <= .04045 else ((v + .055) / 1.055) ** 2.4 for v in channels]

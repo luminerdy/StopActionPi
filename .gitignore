@@ -9,6 +9,9 @@ joined_images_*/
 .frame-order.json
 .photo-messages.json
 .photo-drawings.json
+.photo-holds.json
+.support-edits.json
+.clean-backgrounds/
 *.mp4
 frame_*.png
 .env
