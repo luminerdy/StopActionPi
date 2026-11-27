@@ -2,6 +2,8 @@
 
 Make a stop motion movie on a Raspberry Pi. Move a figure a little, take a photo, and play your movie as it grows. The live camera, recent photos, and keyboard guide fit on one screen. StopActionPi runs locally and keeps each movie's source photos and exports in its project folder.
 
+[Feature guide](FEATURES.md) · [Menu diagram](MENU.md)
+
 ## What you need
 
 - A Raspberry Pi 500 running 64-bit Raspberry Pi OS Desktop. The app was tested on the Debian 13 (Trixie) release.
