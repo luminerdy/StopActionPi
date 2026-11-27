@@ -8,6 +8,8 @@ Make a stop motion movie on a Raspberry Pi. Move a figure a little, take a photo
 - A monitor, plus a USB webcam when taking photos. The Logitech C270 was tested at 1280 × 720. A fixed camera and steady light help keep shots consistent.
 - For narration, a microphone and an audio output you can listen to. The C270 has a built-in mic, and a monitor with HDMI speakers can play the preview.
 
+See the [StopActionPi hardware parts list](BOM.md) for the camera, arm, optional shutter remote, and other parts for one station.
+
 ## Install on the Pi
 
 Connect the webcam to USB. From a terminal on the Pi desktop, run:
